@@ -1,0 +1,86 @@
+;;; markdown-gui-smoke.el --- Real Quarto view smoke test -*- lexical-binding: t; -*-
+;; Copyright (C) 2026 Jorge Noreña
+;; SPDX-License-Identifier: GPL-3.0-or-later
+(setq load-prefer-newer t)
+(require 'markdown-test)
+(require 'quarto-mode)
+(require 'posframe)
+
+(defun live-tex-preview-test--markdown-gui ()
+  (let ((host (generate-new-buffer "live-tex-gui.qmd"))
+        (directory (make-temp-file "live-tex-md-gui-" t)) failure)
+    (unwind-protect
+        (condition-case err
+            (progn
+              (switch-to-buffer host)
+              (insert live-tex-preview-test--qmd)
+              (poly-quarto-mode)
+              (setq default-directory (file-name-as-directory directory))
+              (setq-local markdown-enable-math t)
+              (pm-flush-span-cache 1 (point-max))
+              (live-tex-preview-mode 1)
+              (live-tex-preview-buffer)
+              (live-tex-preview-test--await (car live-tex-preview--jobs))
+              (unless (= (length (cl-remove-if-not
+                                  (lambda (ov) (overlay-get ov 'live-tex-preview-type))
+                                  (overlays-in 1 (point-max)))) 3)
+                (error "Wrong Quarto overlay count"))
+              (goto-char 1) (search-forward "$E=")
+              (let ((source (car (overlays-at (point)))))
+                (pm-switch-to-buffer)
+                (unless (eq source live-tex-preview-polymode--source) (error "No math view"))
+                (unless (eq (overlay-buffer source) host) (error "Overlay escaped host"))
+                (unless (overlay-get live-tex-preview-polymode--presentation 'after-string)
+                  (error "No live inline image"))
+                (insert "z")
+                (let ((deadline (+ 10 (float-time))))
+                  (while (and (eq (overlay-get source 'live-tex-preview-state) 'modified)
+                              (< (float-time) deadline))
+                    (accept-process-output nil 0.05)))
+                (unless (eq (overlay-get source 'live-tex-preview-state) 'active)
+                  (error "Timed math-inner edit did not render"))
+                (goto-char (overlay-end source))
+                (pm-switch-to-buffer)
+                (unless (eq (current-buffer) host) (error "Did not return to prose"))
+                (unless (overlay-get source 'display) (error "Leave did not restore image")))
+              (search-forward "H^2")
+              (pm-switch-to-buffer)
+              ;; Some poly-markdown versions leave $$ followed immediately
+              ;; by newline in the host.  Exercise its normal post-command UI.
+              (when (eq (current-buffer) host)
+                (live-tex-preview-mode--handle-post-cursor))
+              (unless live-tex-preview-live--popup-overlay
+                (error "No block posframe: %S"
+                       (list major-mode (eq (current-buffer) host) (point)
+                             live-tex-preview-display-live
+                             (live-tex-preview-live--popup-workable-p)
+                             (mapcar #'overlay-properties (overlays-at (point))))))
+              (let ((size (image-size (overlay-get (or live-tex-preview-polymode--source
+                                                       live-tex-preview-live--popup-overlay)
+                                                   'live-tex-preview-image) t)))
+                (unless (and (> (car size) 0) (> (cdr size) 0)) (error "Invalid SVG size")))
+              ;; Actual switch into an executable chunk must neither own
+              ;; preview overlays nor leave the math presentation running.
+              (search-forward "x =")
+              (pm-switch-to-buffer)
+              (when live-tex-preview-mode (error "Preview mode enabled in code"))
+              (when live-tex-preview-polymode--presentation (error "Math view leaked into code"))
+              (when (cl-some (lambda (ov) (overlay-get ov 'live-tex-preview-type))
+                             (overlays-in (point-min) (point-max)))
+                (error "Source overlay moved to code"))
+              (search-forward "More prose")
+              (pm-switch-to-buffer)
+              (unless (eq (current-buffer) host) (error "Prose after code not restored"))
+              (live-tex-preview-clear)
+              (live-tex-preview-mode -1))
+          (error (setq failure (error-message-string err))))
+      (when (buffer-live-p host) (kill-buffer host))
+      (delete-directory directory t))
+    (with-temp-file "/tmp/live-tex-preview-markdown-gui-result.el"
+      (prin1 (list :success (not failure) :error failure
+                   :checks '(three-prose-images actual-polymode-switches host-ownership
+						inline-timer-edit restore-on-leave block-posframe code-exclusion))
+             (current-buffer)))
+    (kill-emacs (if failure 1 0))))
+
+(run-at-time 1 nil #'live-tex-preview-test--markdown-gui)

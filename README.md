@@ -1,6 +1,6 @@
 # live-tex-preview
 
-Personal local Emacs package for asynchronous, live LaTeX equation previews.
+Personal Emacs package for asynchronous math previews in TeX, Markdown and Quarto.
 GPL-3.0-or-later. This is an extracted and maintained personal implementation,
 not a MELPA release.
 
@@ -12,11 +12,16 @@ not a MELPA release.
   Doom, parsing or export dependency.
 - `live-tex-preview.el`: buffer placement, image specs, overlay edit state,
   cursor reveal/restore, lazy display, inline live strings and block posframes.
-  The existing cursor and popup behavior is retained. Three buffer-local
-  functions supply fragment lookup, block classification and rendering settings;
-  there is no provider registry.
+  Also owns the shared interactive commands and minor mode. Small buffer-local
+  callbacks supply scanning, local fragment lookup, block classification,
+  rendering settings and document directory; there is no provider registry.
 - `live-tex-preview-tex.el`: TeX scanner, master/preamble resolution, optional
-  numbering removal, project cache, interactive commands and minor mode.
+  numbering removal and document-specific rendering settings.
+- `live-tex-preview-markdown.el`: conservative math delimiters with markdown-mode
+  code and metadata exclusions, plus a separate configurable math preamble.
+- `live-tex-preview-polymode.el`: optional host-overlay ownership and live math
+  views for poly-markdown/poly-quarto. Executable inner buffers never enable the
+  preview minor mode.
 
 The renderer writes uncached fragments into one `preview.sty` document, runs
 `latex` once, then converts the DVI pages using `dvisvgm`. It reads height,
@@ -43,14 +48,19 @@ tokens reject results for overlays edited or deleted during compilation.
   message; static and inline previews still work.
 - AUCTeX is optional: its master-file information is used when available.
   Built-in `latex-mode` works too. No Org or Doom dependency.
+- `markdown-mode` 2.6+ for Markdown/Quarto. Polymode and Quarto are optional,
+  needed only when using those editing modes. No Quarto CLI is needed to preview
+  math. Their own dependencies remain managed by their packages.
 
 Outside Doom:
 
 ```elisp
 (add-to-list 'load-path "/path/to/dotfiles/live-tex-preview")
-(require 'live-tex-preview-tex)
+(require 'live-tex-preview)
 (add-hook 'LaTeX-mode-hook #'live-tex-preview-mode)
 (add-hook 'latex-mode-hook #'live-tex-preview-mode)
+(add-hook 'markdown-mode-hook #'live-tex-preview-mode)
+(add-hook 'poly-quarto-mode-hook #'live-tex-preview-mode)
 ```
 
 The repository's Doom `packages.el` declares a straight local recipe, plus
@@ -62,6 +72,64 @@ The development-only automatic Org preview minor mode is no longer enabled.
 Existing LaTeX localleader keys are preserved: `v v` toggle live interaction,
 `v P` preview buffer, `v p` preview at point, `v c` clear previews, `v C` clear
 cached images. The raw-TeX toggle uses the new commands too.
+Markdown/Quarto host buffers use the same `v` bindings. Loading the old
+`live-tex-preview-tex` feature still works; commands now dispatch in the common
+library. A TeX mode hook firing in a Quarto indirect buffer cannot enable a TeX
+frontend there. The GitHub recipe migration is separate from this frontend work;
+the dotfiles currently still use the local package checkout.
+
+## Markdown and Quarto policy
+
+Recognized delimiters are `$...$`, `$$...$$`, `\(...\)` and `\[...\]`.
+Double dollars take precedence. Display math can span lines, but no fragment
+crosses a blank paragraph, code or metadata. Arbitrary LaTeX environments outside
+these delimiters are not recognized.
+
+Single-dollar math is deliberately conservative: one line, non-whitespace beside
+the inner delimiters, no word character immediately before the opener or after
+the closer. Numeric-leading expressions such as `$2x$`, `$20$`, and `$0.5$`
+are accepted when both delimiters occur on the same line in prose. The first
+unescaped dollar must be a valid closer. Dollar runs of three or more are
+rejected. Lone currency such as `$20` and amounts such as `$20 and $30` are
+ignored. Deliberately paired text like `$20$` or `$USD$` remains inherently
+ambiguous and is treated as math; escape currency dollars when necessary.
+Multiline math uses display delimiters such as `$$...$$`.
+
+The frontend uses markdown-mode's syntax properties and code matchers for inline
+code (including multiple backticks), fenced code, recognized indented code,
+YAML front matter and comments. It also checks unfinished fence openers, since
+markdown-mode may not mark their unfinished bodies. Syntax properties are
+updated incrementally; math fontification settings are not changed. Polymode
+non-math inner spans provide an additional exclusion for executable/raw regions.
+This is not an independent complete CommonMark or HTML parser: other syntax
+extensions are only excluded when the host mode identifies them as code.
+
+Quarto prose uses that same scanner. Source overlays stay in the Markdown host;
+commands invoked in an indirect buffer target that host, preserving caller point
+and narrowing. When Polymode places math in a LaTeX inner buffer, a temporary
+inline image or block posframe displays the host's result while source is edited.
+The source overlays and render jobs never belong to executable inner buffers.
+Chunk navigation, syntax highlighting and execution configuration are unchanged.
+
+Markdown has its own `live-tex-preview-markdown-preamble` (article, AMS and colors)
+and `live-tex-preview-markdown-extra-preamble`. For project-specific macros, set
+the latter through Customize or a directory-local variable, for example:
+
+```elisp
+((markdown-mode
+  . ((live-tex-preview-markdown-extra-preamble
+      . "\\newcommand{\\Pk}{P(k)}\n"))))
+```
+
+YAML `header-includes`, YAML includes/anchors, `_quarto.yml`, profiles and Quarto
+format inheritance are **not resolved**. The installed Quarto mode supplies no
+YAML/configuration parser; explicit preamble configuration avoids partial or
+incorrect macro extraction. TeX document-preamble resolution is unchanged.
+
+Live edits inspect the existing fragment with its overlay end as a strict limit;
+they do not invoke the whole-document scanner. Structural Markdown changes
+debounce validation of existing overlays, so wrapping a rendered equation in code
+removes its preview. Newly typed formulas still need an initial explicit preview.
 
 ## Rendering and placement APIs
 
@@ -97,7 +165,7 @@ image spec with optional zoom. The caller chooses how to display it.
 
 Placement returns the same job type and installs previews when results arrive.
 Interactive `live-tex-preview-buffer`, `-region`, `-at-point`, `-clear`,
-`-clear-cache`, and `-mode` are supplied by the TeX frontend.
+`-clear-cache`, and `-mode` dispatch to the appropriate frontend.
 
 ## Cache and limitations
 
@@ -128,10 +196,11 @@ callback and leaves source editable. Errors confined to individual fragments
 cause a retry batch of the surviving fragments, so one bad equation does not
 prevent the others from rendering. Results for failed fragments remain nil.
 
-To add Markdown/Quarto later, implement a separate frontend that finds fragments,
-selects a preamble, and supplies the three interaction callbacks. It can pass
-strings to the renderer and `(BEG END LATEX)` entries to placement. No engine
-change is needed. Neither frontend is implemented here.
+The Markdown/Quarto addition did not change the engine or public rendering API.
+A future notebook-output integration can call `live-tex-preview-render` directly;
+it still needs to choose a preamble/cache policy, manage output replacement and
+cancellation, and display the returned image metadata in its own UI. No notebook
+package was modified here.
 
 ## Provenance and licensing
 
@@ -171,6 +240,20 @@ emacs -Q --batch -L live-tex-preview -f batch-byte-compile \
   live-tex-preview/live-tex-preview-tex.el
 ```
 
+The Markdown suite includes the TeX regression suite:
+
+```sh
+emacs -Q --batch -L live-tex-preview -L live-tex-preview/test \
+  -L /path/to/markdown-mode \
+  -l markdown-test -f ert-run-tests-batch-and-exit
+```
+
+Also supply `-L` paths for Polymode, poly-markdown, quarto-mode and its request
+dependency to run the real Quarto indirect-buffer tests (otherwise they skip).
+To byte-compile the optional frontends, put markdown-mode and Polymode on
+`load-path` and include `live-tex-preview-markdown.el` and
+`live-tex-preview-polymode.el` in the compilation command.
+
 Tests cover scanning, comments/escapes, document bounds, master selection,
 number rewriting, sanitization, hashes, actual rendering/cache hits, API shape,
 stale callbacks, delimiter deletion, enter/edit/leave and terminal behavior.
@@ -183,8 +266,17 @@ launch it with `emacs -Q`, the package and test directories, and posframe on
 image dimensions, timed live updates, inline display, block posframe and text
 scaling without loading the development preview library.
 
-Verified on 2026-09-14: 15/15 ERT tests pass; the three package files byte-compile
-without warnings on Emacs 30.2. The GUI smoke test passed with system Org 9.7.11,
-including inline timed regeneration, cursor leave restoration, posframe and text
-scaling. Full interactive Evil/AUCTeX motion stress testing in the user's normal
-Doom session remains a manual check after `doom sync` and restart.
+`test/markdown-gui-smoke.el` tests actual Quarto buffer switches, host ownership,
+timed math-inner edits, image restoration, block posframes and code exclusion.
+Run it in a clean graphical Emacs with the same dependencies plus posframe on
+`load-path`. It writes `/tmp/live-tex-preview-markdown-gui-result.el` and exits.
+
+Verified on 2026-09-15: 34/34 ERT tests pass, including real rendering and Quarto
+indirect buffers; package files byte-compile without warnings on Emacs 30.2.
+The Quarto GUI smoke test passes. A static Markdown scan of 500 prose equations
+interleaved with 500 code chunks took about 0.15 seconds on the development
+machine. Live-lookup tests explicitly forbid calling the whole-document scanner.
+The original TeX GUI test checks system Org 9.7.11, timed regeneration, cursor
+restoration, posframe and text scaling. Full interactive Evil/AUCTeX stress
+testing in the user's normal Doom session remains a manual check after
+`doom sync` and restart.

@@ -21,19 +21,17 @@
 ;;; Code:
 
 (require 'live-tex-preview)
+
+(defun live-tex-preview-tex--setup ()
+  "Select TeX scanning and refresh master/preamble information."
+  (setq-local live-tex-preview-fragment-function #'live-tex-preview--fragment-at
+              live-tex-preview-render-function #'live-tex-preview--place
+              live-tex-preview-block-function #'live-tex-preview--block-fragment-p
+              live-tex-preview-scan-function #'live-tex-preview--scan-region
+              live-tex-preview-directory-function #'live-tex-preview--main-dir)
+  (live-tex-preview--reset-caches))
 (defvar TeX-master)
 (declare-function TeX-master-file "tex")
-(defcustom live-tex-preview-cache-directory ".cache"
-  "Where to put the files the preview machinery generates.
-A directory name resolved relative to the document; the transient LaTeX
-files (the input `.tex', `.dvi'/`.aux'/`.log') and
-the cached preview images all go here, instead of littering the document
-directory and the system temp dir.
-
-Set to nil to use `live-tex-preview-engine-cache-directory'."
-  :type '(choice (const :tag "Engine default" nil)
-                 (string :tag "Directory name (relative to the document)"))
-  :group 'live-tex-preview)
 
 (defcustom live-tex-preview-environments
   '("equation" "equation*" "align" "align*" "alignat" "alignat*"
@@ -79,13 +77,6 @@ loads it is harmless."
   :type 'string
   :group 'live-tex-preview)
 
-(defcustom live-tex-preview-page-width "475pt"
-  "LaTeX text width used when compiling preview fragments.
-Set to nil to leave the document class's text width unchanged."
-  :type '(choice (const :tag "Document default" nil)
-                 (string :tag "LaTeX dimension")
-                 (number :tag "Fraction of paper width"))
-  :group 'live-tex-preview)
 
 (defun live-tex-preview--in-comment-p (pos)
   "Non-nil if POS is inside a TeX comment.
@@ -98,16 +89,6 @@ Works in temporary preamble buffers as well as LaTeX major modes."
         (unless (live-tex-preview--escaped-p (1- (point))) (setq found t)))
       found)))
 
-(defun live-tex-preview--escaped-p (pos)
-  "Non-nil if the character at POS is preceded by an odd number of backslashes."
-  (save-excursion
-    (goto-char pos)
-    (let ((n 0))
-      (while (and (> (point) (point-min))
-                  (eq (char-before) ?\\))
-        (setq n (1+ n))
-        (backward-char))
-      (cl-oddp n))))
 
 (defun live-tex-preview--opener-re ()
   "Regexp matching any math opener.
@@ -356,12 +337,12 @@ the exported document, but if Org's preview precompiler sees it before
 `preview.sty' has been appended, the generated format omits the preview
 environment.  Strip it from preview preambles too."
   (thread-last preamble
-    (replace-regexp-in-string "^[ \t]*%&[^\n]*\\(?:\n\\|\\'\\)" "")
-    (replace-regexp-in-string
-     "^[ \t]*%+[ \t]*end precompiled preamble[ \t]*\n" "")
-    (replace-regexp-in-string
-     "\\\\ifcsname[ \t]+endofdump\\\\endcsname\\\\endofdump\\\\fi" "")
-    (replace-regexp-in-string "\\\\endofdump\\>" "")))
+	       (replace-regexp-in-string "^[ \t]*%&[^\n]*\\(?:\n\\|\\'\\)" "")
+	       (replace-regexp-in-string
+		"^[ \t]*%+[ \t]*end precompiled preamble[ \t]*\n" "")
+	       (replace-regexp-in-string
+		"\\\\ifcsname[ \t]+endofdump\\\\endcsname\\\\endofdump\\\\fi" "")
+	       (replace-regexp-in-string "\\\\endofdump\\>" "")))
 
 (defun live-tex-preview--preamble ()
   "Return the LaTeX preamble for previews (cached per buffer).
@@ -392,105 +373,6 @@ file (see `live-tex-preview--main-file'); otherwise from this buffer.
    :cache-directory (and live-tex-preview-cache-directory
                          (expand-file-name live-tex-preview-cache-directory
                                            (live-tex-preview--main-dir)))))
-
-;;;###autoload
-(defun live-tex-preview-clear-cache ()
-  "Delete only this package's cached image/metadata files for the project."
-  (interactive)
-  (let* ((directory (if live-tex-preview-cache-directory
-                        (expand-file-name live-tex-preview-cache-directory (live-tex-preview--main-dir))
-                      live-tex-preview-engine-cache-directory))
-         (files (and (file-directory-p directory)
-                     (directory-files directory t "\\`live-tex-[[:xdigit:]]\\{64\\}\\.\\(?:svg\\|eld\\)\\'"))))
-    (when (and files (yes-or-no-p (format "Delete %d preview cache files in %s? " (length files) directory)))
-      (live-tex-preview--cleanup)
-      (live-tex-preview-clear)
-      (mapc #'delete-file files)
-      (message "Deleted %d generated preview files; they can be regenerated" (length files)))))
-
-;;;###autoload
-(defun live-tex-preview-region (beg end)
-  "Preview LaTeX math fragments between BEG and END."
-  (interactive "r")
-  (live-tex-preview--ensure-graphical "rendering LaTeX previews" t)
-  (live-tex-preview--reset-caches)     ;pick up preamble / TeX-master edits
-  (live-tex-preview-clear-overlays beg end)
-  (let ((entries (live-tex-preview--scan-region beg end)))
-    (if (null entries)
-        (message "live-tex-preview: no math fragments found")
-      (live-tex-preview--place entries)
-      (message "live-tex-preview: rendering %d fragment(s)..." (length entries)))))
-
-;;;###autoload
-(defun live-tex-preview-buffer ()
-  "Preview every LaTeX math fragment in the buffer."
-  (interactive)
-  (live-tex-preview-region (point-min) (point-max)))
-
-;;;###autoload
-(defun live-tex-preview-at-point ()
-  "Preview the LaTeX math fragment at point."
-  (interactive)
-  (live-tex-preview--ensure-graphical "rendering LaTeX previews" t)
-  (live-tex-preview--reset-caches)
-  (if-let ((frag (live-tex-preview--fragment-at-point)))
-      (progn
-        (live-tex-preview-clear-overlays (nth 0 frag) (nth 1 frag))
-        (live-tex-preview--place (list frag))
-        (message "live-tex-preview: rendering fragment at point..."))
-    (message "live-tex-preview: no math fragment at point")))
-
-;;;###autoload
-(defun live-tex-preview-clear ()
-  "Remove all LaTeX preview overlays in the buffer."
-  (interactive)
-  (live-tex-preview-clear-overlays (point-min) (point-max))
-  (message "live-tex-preview: cleared"))
-
-;;;###autoload
-(define-minor-mode live-tex-preview-mode
-  "Seamlessly edit LaTeX previews in (La)TeX buffers.
-
-When on, moving the cursor onto a rendered preview reveals its LaTeX
-source, and moving away restores the image (recompiling first if it was
-edited).  While the cursor sits in a fragment, a live-updating preview is
-shown in a popup (display math) or beside (inline math) the source as you type
-— see `live-tex-preview-display-live'.
-
-This minor mode only handles auto open/close and live updating.  Generate
-the previews themselves with `live-tex-preview-buffer' or
-`live-tex-preview-region'."
-  :lighter " LtxPrev"
-  (if live-tex-preview-mode
-      (if (not (live-tex-preview--ensure-graphical "live-tex-preview-mode"))
-          (setq live-tex-preview-mode nil)
-        (setq-local live-tex-preview-fragment-function #'live-tex-preview--fragment-at
-                    live-tex-preview-render-function #'live-tex-preview--place
-                    live-tex-preview-block-function #'live-tex-preview--block-fragment-p)
-        (setq live-tex-preview-mode--marker (make-marker))
-        (add-hook 'pre-command-hook
-                  #'live-tex-preview-mode--handle-pre-cursor nil 'local)
-        (live-tex-preview-mode--handle-pre-cursor) ;prime before first command
-        (add-hook 'post-command-hook
-                  #'live-tex-preview-mode--handle-post-cursor nil 'local)
-        (add-hook 'post-command-hook
-                  #'live-tex-preview--refresh-visible-overlays 90 'local)
-        (when live-tex-preview-display-live
-          (live-tex-preview-live--setup)))
-    (remove-hook 'pre-command-hook
-                 #'live-tex-preview-mode--handle-pre-cursor 'local)
-    (remove-hook 'post-command-hook
-                 #'live-tex-preview-mode--handle-post-cursor 'local)
-    (remove-hook 'post-command-hook
-                 #'live-tex-preview--refresh-visible-overlays 'local)
-    (live-tex-preview-live--teardown)
-    (live-tex-preview--cleanup)
-    (dolist (ov (overlays-in (point-min) (point-max)))
-      (when (eq (overlay-get ov 'live-tex-preview-type) 'live-tex-preview-overlay)
-        (overlay-put ov 'live-tex-preview-view-text nil)
-        (unless (eq (overlay-get ov 'live-tex-preview-state) 'modified)
-          (overlay-put ov 'display (overlay-get ov 'live-tex-preview-image)))))))
-
 
 (provide 'live-tex-preview-tex)
 ;;; live-tex-preview-tex.el ends here
