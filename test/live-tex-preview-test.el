@@ -1,0 +1,227 @@
+;;; live-tex-preview-test.el --- Focused tests -*- lexical-binding: t; -*-
+;; Copyright (C) 2026 Jorge Noreña
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+(require 'ert)
+(require 'live-tex-preview-tex)
+
+(defmacro live-tex-preview-test--buffer (text &rest body)
+  (declare (indent 1))
+  `(with-temp-buffer
+     (latex-mode)
+     (insert ,text)
+     ,@body))
+
+(ert-deftest live-tex-preview-test-scanner ()
+  (live-tex-preview-test--buffer
+      "$a$ $$b$$ \\(c\\) \\[d\\] \\begin{align}e&=f\\end{align}"
+    (should (equal (mapcar #'caddr (live-tex-preview--scan-region (point-min) (point-max)))
+                   '("$a$" "$$b$$" "\\(c\\)" "\\[d\\]" "\\begin{align*}e&=f\\end{align*}")))))
+
+(ert-deftest live-tex-preview-test-comments-escapes-and-region ()
+  (live-tex-preview-test--buffer
+      "% $ignored$ \\[ignored\\]\n\\$literal $a\\$b$ \\[x % \\] ignored\n y\\]"
+    (should (equal (mapcar #'caddr (live-tex-preview--scan-region 1 (point-max)))
+                   '("$a\\$b$" "\\[x % \\] ignored\n y\\]")))
+    (goto-char (point-min))
+    (search-forward "$a")
+    (should-not (live-tex-preview--scan-region (1- (point)) (point)))))
+
+(ert-deftest live-tex-preview-test-document-body ()
+  (live-tex-preview-test--buffer
+      "% \\begin{document}\n\\newcommand{\\a}{$p$}\n\\begin{document}$x$\\end{document}$z$"
+    (should (equal (mapcar #'caddr (live-tex-preview--scan-region 1 (point-max))) '("$x$"))))
+  (live-tex-preview-test--buffer "\\begin{document}$x$"
+    (should (= (cdr (live-tex-preview--document-body-bounds)) (point-max)))))
+
+(ert-deftest live-tex-preview-test-unnumber ()
+  (let ((source "\\begin{equation}x\\end{equation}"))
+    (should (equal (live-tex-preview--unnumber source) "\\begin{equation*}x\\end{equation*}"))
+    (let ((live-tex-preview-unnumber nil))
+      (should (equal (live-tex-preview--unnumber source) source)))))
+
+(ert-deftest live-tex-preview-test-sanitize ()
+  (should (equal (live-tex-preview--sanitize-preamble
+                  "%& bad\n\\documentclass{article}\n\\ifcsname endofdump\\endcsname\\endofdump\\fi\n\\endofdump")
+                 "\\documentclass{article}\n\n")))
+
+(ert-deftest live-tex-preview-test-master ()
+  (live-tex-preview-test--buffer "% !TEX root = ../main.tex\n$x$"
+    (let ((default-directory "/tmp/project/child/"))
+      (should (equal (live-tex-preview--compute-main-file) "/tmp/project/main.tex"))))
+  (live-tex-preview-test--buffer "$x$"
+    (setq-local TeX-master "main")
+    (let ((default-directory "/tmp/"))
+      (should (equal (live-tex-preview--compute-main-file) "/tmp/main.tex")))))
+
+(ert-deftest live-tex-preview-test-hash ()
+  (let ((key (live-tex-preview-engine--hash "$x$" "p" "475pt" "/tmp/")))
+    (should (= (length key) 64))
+    (should (equal key (live-tex-preview-engine--hash "$x$" "p" "475pt" "/tmp/")))
+    (dolist (args '(("$y$" "p" "475pt" "/tmp/") ("$x$" "q" "475pt" "/tmp/")
+                    ("$x$" "p" "300pt" "/tmp/") ("$x$" "p" "475pt" "/other/")))
+      (should-not (equal key (apply #'live-tex-preview-engine--hash args))))))
+
+(ert-deftest live-tex-preview-test-terminal ()
+  (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () nil)))
+    (with-temp-buffer
+      (live-tex-preview-mode 1)
+      (should-not live-tex-preview-mode)
+      (should-error (live-tex-preview-buffer) :type 'user-error)
+      (should-not (overlays-in 1 (point-max))))))
+
+(ert-deftest live-tex-preview-test-stale-callback ()
+  (live-tex-preview-test--buffer "$x$"
+    (let (callback)
+      (cl-letf (((symbol-function 'live-tex-preview-render)
+                 (lambda (_strings cb &rest _) (setq callback cb) nil)))
+        (live-tex-preview-place '((1 4 "$x$")))
+        (goto-char 3)
+        (insert "y")
+        (funcall callback [(:file "/tmp/not-used.svg" :height 1 :depth 0.2 :width 1)] nil)
+        (should-not (overlay-get (car (overlays-at 2)) 'display))
+        (setq live-tex-preview--jobs nil)))))
+
+(ert-deftest live-tex-preview-test-delimiter-deletion ()
+  (live-tex-preview-test--buffer "$x$ and $y$"
+    (setq-local live-tex-preview-fragment-function #'live-tex-preview--fragment-at)
+    (let ((ov (live-tex-preview--ensure-overlay 1 4)))
+      (goto-char 3) (delete-char 1)
+      (should-not (live-tex-preview-mode--fragment-for-overlay ov)))))
+
+(defun live-tex-preview-test--await (job)
+  (let ((deadline (+ (float-time) 20)))
+    (while (and (memq (live-tex-preview-job-status job) '(pending running))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.02))
+    (should (eq (live-tex-preview-job-status job) 'done))))
+
+(ert-deftest live-tex-preview-test-real-render-cache-and-edit ()
+  (skip-unless (and (executable-find "latex") (executable-find "dvisvgm")))
+  (let ((directory (make-temp-file "live-tex-test-" t))
+        (calls 0) (completed nil))
+    (unwind-protect
+        (progn
+          (let ((job (live-tex-preview-render
+                      '("$x_1$" "\\[\\frac{a}{b}\\]")
+                      (lambda (results error-text)
+                        (cl-incf calls) (should-not error-text) (setq completed results))
+                      :cache-directory directory :input-directory directory)))
+            (should (live-tex-preview-job-p job))
+            (should-not completed)
+            (live-tex-preview-test--await job)
+            (should (= calls 1))
+            (should (= (length completed) 2))
+            (dolist (info (append completed nil))
+              (should (file-exists-p (plist-get info :file)))
+              (should (> (plist-get info :height) 0))
+              (should (> (plist-get info :width) 0))
+              (should (<= 0 (plist-get info :depth) (plist-get info :height)))
+              (should (eq (cdr (plist-get (cdr (live-tex-preview-image info)) :height)) 'em))
+              (with-temp-buffer
+                (insert-file-contents (plist-get info :file))
+                (should (search-forward "currentColor" nil t)))))
+          (let ((live-tex-preview-latex-command "latex"))
+            (cl-letf (((symbol-function 'live-tex-preview-engine--run)
+                       (lambda (&rest _) (ert-fail "Cache hit spawned a process"))))
+              (live-tex-preview-test--await
+               (live-tex-preview-render '("$x_1$") (lambda (_ e) (should-not e))
+                                        :cache-directory directory :input-directory directory))))
+          (live-tex-preview-test--buffer
+              "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\nBefore $x$ after \\[y\\] end\n\\end{document}"
+            (setq default-directory (file-name-as-directory directory))
+            (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+              (live-tex-preview-mode 1)
+              (live-tex-preview-test--await
+               (live-tex-preview--place (live-tex-preview--scan-region 1 (point-max))))
+              (goto-char (point-min)) (search-forward "$x$")
+              (backward-char 2)
+              (let* ((ov (car (overlays-at (point))))
+                     (old (plist-get (overlay-get ov 'live-tex-preview-metadata) :key)))
+                (set-marker live-tex-preview-mode--marker (point))
+                (live-tex-preview-mode--open-this-overlay)
+                (should (overlay-get ov 'live-tex-preview-view-text))
+                (should-not (overlay-get ov 'display))
+                (insert "z")
+                (live-tex-preview-live--regenerate)
+                (live-tex-preview-test--await (car live-tex-preview--jobs))
+                (should-not (equal old (plist-get (overlay-get ov 'live-tex-preview-metadata) :key)))
+                (live-tex-preview-mode--handle-pre-cursor)
+                (goto-char (overlay-end ov))
+                (live-tex-preview-mode--handle-post-cursor)
+                (should (overlay-get ov 'display))
+                (should-not (overlay-get ov 'live-tex-preview-view-text)))
+              (live-tex-preview-mode -1)
+              (should-not live-tex-preview--jobs)
+              (should-not live-tex-preview--timers))))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-cancellation-and-errors ()
+  (let ((directory (make-temp-file "live-tex-error-test-" t)) (calls 0))
+    (unwind-protect
+        (progn
+          (let ((job (live-tex-preview-render '("$x$") (lambda (_ e) (cl-incf calls) (should e))
+                                              :cache-directory directory)))
+            (live-tex-preview-cancel job)
+            (live-tex-preview-cancel job)
+            (should (= calls 1))
+            (should (eq (live-tex-preview-job-status job) 'cancelled)))
+          (let* ((live-tex-preview-latex-command "does-not-exist-live-tex-test")
+                 (job (live-tex-preview-render '("$x$") (lambda (_ e) (should e)) :cache-directory directory)))
+            (while (memq (live-tex-preview-job-status job) '(pending running))
+              (accept-process-output nil 0.02))
+            (should (eq (live-tex-preview-job-status job) 'failed))
+            (should-not (directory-files directory nil "live-tex-job-"))))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-bad-fragment-isolation ()
+  (skip-unless (and (executable-find "latex") (executable-find "dvisvgm")))
+  (let ((directory (make-temp-file "live-tex-mixed-test-" t)) result error-text)
+    (unwind-protect
+        (let ((job (live-tex-preview-render
+                    '("$x$" "$\\undefinedLiveTexCommand$" "$y$")
+                    (lambda (r e) (setq result r error-text e)) :cache-directory directory)))
+          (while (memq (live-tex-preview-job-status job) '(pending running))
+            (accept-process-output nil 0.02))
+          (should (eq (live-tex-preview-job-status job) 'failed))
+          (should error-text)
+          (should (aref result 0))
+          (should-not (aref result 1))
+          (should (aref result 2))
+          (should-not (directory-files directory nil "live-tex-job-")))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-persistent-metadata ()
+  (let ((directory (make-temp-file "live-tex-meta-test-" t))
+        (key (make-string 64 ?a)))
+    (unwind-protect
+        (let ((svg (expand-file-name (concat "live-tex-" key ".svg") directory))
+              (meta (expand-file-name (concat "live-tex-" key ".eld") directory)))
+          (with-temp-file svg (insert "<svg/>"))
+          (with-temp-file meta (insert "(:height invalid)"))
+          (should-not (live-tex-preview-engine--cached key directory))
+          (with-temp-file meta (prin1 (list :key key :height 1 :depth 0.2 :width 2) (current-buffer)))
+          (should (equal (plist-get (live-tex-preview-engine--cached key directory) :file) svg))
+          (delete-file svg)
+          (should-not (live-tex-preview-engine--cached key directory)))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-master-preamble-real-render ()
+  (skip-unless (and (executable-find "latex") (executable-find "dvisvgm")))
+  (let ((directory (make-temp-file "live-tex-master-test-" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "macros.tex" directory)
+            (insert "\\newcommand{\\testmacro}{x_2}\n"))
+          (with-temp-file (expand-file-name "main.tex" directory)
+            (insert "%& nonexistent-format\n\\documentclass{article}\n\\input{macros}\n"
+                    "\\ifcsname endofdump\\endcsname\\endofdump\\fi\n\\begin{document}\n\\end{document}\n"))
+          (live-tex-preview-test--buffer "% !TEX root = main.tex\n$\\testmacro$"
+            (setq default-directory (file-name-as-directory directory)
+                  buffer-file-name (expand-file-name "child.tex" directory))
+            (live-tex-preview-test--await
+             (live-tex-preview--place (live-tex-preview--scan-region 1 (point-max))))
+            (should (= (length (directory-files (expand-file-name ".cache" directory) nil "\\.svg$")) 1))))
+      (delete-directory directory t))))
+
+(provide 'live-tex-preview-test)

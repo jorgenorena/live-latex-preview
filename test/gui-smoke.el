@@ -1,0 +1,73 @@
+;;; gui-smoke.el --- Standalone GUI smoke test -*- lexical-binding: t; -*-
+;; Copyright (C) 2026 Jorge Noreña
+;; SPDX-License-Identifier: GPL-3.0-or-later
+;; Run in a fresh graphical emacs -Q with package and posframe on load-path.
+(setq load-prefer-newer t)
+(require 'org)
+(require 'live-tex-preview-test)
+(require 'posframe)
+
+(defun live-tex-preview-test-gui ()
+  (condition-case err
+      (let ((directory (make-temp-file "live-tex-gui-" t))
+            (buffer (generate-new-buffer "*live-tex-preview smoke*")) report)
+        (unwind-protect
+            (with-current-buffer buffer
+              (switch-to-buffer buffer)
+              (latex-mode)
+              (setq default-directory (file-name-as-directory directory))
+              (insert "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\nBefore $x_1$ after.\n\\[\\frac{a}{b}\\]\nEnd.\n\\end{document}\n")
+              (unless (display-graphic-p) (error "Graphical frame required"))
+              (when (featurep (intern (concat "org-" "latex-preview")))
+                (error "Development preview library loaded"))
+              (live-tex-preview-mode 1)
+              (live-tex-preview-test--await
+               (live-tex-preview--place (live-tex-preview--scan-region 1 (point-max))))
+              (dolist (ov (overlays-in 1 (point-max)))
+                (when-let ((spec (overlay-get ov 'live-tex-preview-image)))
+                  (let ((size (image-size spec t)))
+                    (unless (and (> (car size) 0) (> (cdr size) 0)) (error "Bad image size"))
+                    (push (list :pixels size :ascent (plist-get (cdr spec) :ascent)) report))))
+              (goto-char 1) (search-forward "$x_1$") (backward-char 4)
+              (set-marker live-tex-preview-mode--marker (point))
+              (live-tex-preview-mode--open-this-overlay)
+              (let ((ov (car (overlays-at (point)))))
+                (unless (overlay-get ov 'after-string) (error "Inline live image missing"))
+                (insert "z")
+                ;; Let the real debounce/throttle timers fire while another
+                ;; buffer is current, exercising timer buffer ownership.
+                (let ((deadline (+ (float-time) 10)))
+                  (while (and (eq (overlay-get ov 'live-tex-preview-state) 'modified)
+                              (< (float-time) deadline))
+                    (with-current-buffer (get-buffer-create " *smoke-other*")
+                      (accept-process-output nil 0.1))))
+                (when (eq (overlay-get ov 'live-tex-preview-state) 'modified)
+                  (error "Live edit timer did not regenerate"))
+                (live-tex-preview-mode--handle-pre-cursor)
+                (goto-char (overlay-end ov))
+                (live-tex-preview-mode--handle-post-cursor)
+                (unless (overlay-get ov 'display) (error "Leave did not restore image")))
+              (search-forward "\\[")
+              (set-marker live-tex-preview-mode--marker (point))
+              (live-tex-preview-mode--open-this-overlay)
+              (unless live-tex-preview-live--popup-overlay (error "Block posframe missing"))
+              (when (overlay-get live-tex-preview-live--popup-overlay 'after-string)
+                (error "Block preview adds buffer lines"))
+              (text-scale-set 2)
+              (redisplay t)
+              (live-tex-preview-live--refresh-popup)
+              (live-tex-preview-mode -1)
+              (with-temp-file "/tmp/live-tex-preview-gui-result.el"
+                (prin1 (list :success t :org-version (org-version)
+                             :org-library (locate-library "org") :images report
+                             :inline-edit-leave t :posframe t :text-scale t)
+                       (current-buffer))))
+          (kill-buffer buffer)
+          (delete-directory directory t))
+        (kill-emacs 0))
+    (error
+     (with-temp-file "/tmp/live-tex-preview-gui-result.el"
+       (prin1 (list :success nil :error (error-message-string err)) (current-buffer)))
+     (kill-emacs 1))))
+
+(run-at-time 1 nil #'live-tex-preview-test-gui)

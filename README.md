@@ -1,0 +1,190 @@
+# live-tex-preview
+
+Personal local Emacs package for asynchronous, live LaTeX equation previews.
+GPL-3.0-or-later. This is an extracted and maintained personal implementation,
+not a MELPA release.
+
+## Architecture
+
+- `live-tex-preview-engine.el`: asynchronous string-to-SVG rendering, batch
+  compilation, geometry, hashing, persistent metadata, cancellation and cleanup.
+  Uses `make-process` and sentinels. It has no buffer-overlay, major-mode, Org,
+  Doom, parsing or export dependency.
+- `live-tex-preview.el`: buffer placement, image specs, overlay edit state,
+  cursor reveal/restore, lazy display, inline live strings and block posframes.
+  The existing cursor and popup behavior is retained. Three buffer-local
+  functions supply fragment lookup, block classification and rendering settings;
+  there is no provider registry.
+- `live-tex-preview-tex.el`: TeX scanner, master/preamble resolution, optional
+  numbering removal, project cache, interactive commands and minor mode.
+
+The renderer writes uncached fragments into one `preview.sty` document, runs
+`latex` once, then converts the DVI pages using `dvisvgm`. It reads height,
+depth, width and tightpage margins, uses font-relative image height and baseline
+ascent, and rewrites a foreground stand-in to SVG `currentColor`. Explicit
+LaTeX colors remain intact. Zoom and theme changes do not require recompilation.
+No precompiled formats are generated or used.
+
+Process chaining and on-disk metadata are rewritten for this package. Geometry
+conversion and rendering conventions are adapted from upstream. Cursor and live
+display functions are substantially retained from the old local frontend,
+including its Org-derived functions, with package-owned names and properties.
+Timers retain their source buffer and are cancelled on teardown; generation
+tokens reject results for overlays edited or deleted during compilation.
+
+## Dependencies and installation
+
+- Emacs 29.1 or later; SVG support and a graphical frame for the preview UI.
+  Rendering and metadata creation also work in batch/terminal Emacs.
+- `latex`, `dvisvgm`, and TeX packages `preview`, `xcolor`; the default preamble
+  also uses `amsmath`, `amssymb`, `amsfonts`. A document's actual preamble can
+  require additional TeX packages, fonts, classes and local files.
+- `posframe` for the default block live preview. Missing posframe produces a
+  message; static and inline previews still work.
+- AUCTeX is optional: its master-file information is used when available.
+  Built-in `latex-mode` works too. No Org or Doom dependency.
+
+Outside Doom:
+
+```elisp
+(add-to-list 'load-path "/path/to/dotfiles/live-tex-preview")
+(require 'live-tex-preview-tex)
+(add-hook 'LaTeX-mode-hook #'live-tex-preview-mode)
+(add-hook 'latex-mode-hook #'live-tex-preview-mode)
+```
+
+The repository's Doom `packages.el` declares a straight local recipe, plus
+posframe. `config.org` is the authoritative configuration; tangle it to update
+`config.el`, then run `doom sync` and restart Emacs. Org uses Doom's normal
+recipe/pin; Org buffers use stable Org's preview command and scale settings.
+The development-only automatic Org preview minor mode is no longer enabled.
+
+Existing LaTeX localleader keys are preserved: `v v` toggle live interaction,
+`v P` preview buffer, `v p` preview at point, `v c` clear previews, `v C` clear
+cached images. The raw-TeX toggle uses the new commands too.
+
+## Rendering and placement APIs
+
+```elisp
+(live-tex-preview-render
+ '("$x_1$" "\\[\\frac{a}{b}\\]")
+ (lambda (results error-text)
+   ;; RESULTS is a vector in input order. ERROR-TEXT is nil on success.
+   (unless error-text
+     (message "%s" (plist-get (aref results 0) :file))))
+ :preamble "\\documentclass{article}\n\\usepackage{amsmath}\n"
+ :page-width "475pt"
+ :input-directory "/path/to/project/"
+ :cache-directory "/path/to/project/.cache/")
+```
+
+Returns a `live-tex-preview-job` immediately. The callback runs once,
+asynchronously even for cache hits. Each result is a plist with `:file`, `:key`,
+`:image-type` (`svg`), `:height`, `:depth`, `:width`. Dimensions are em units;
+height includes depth and padding. Unproduced entries are nil. Inspect
+`live-tex-preview-job-status` / `live-tex-preview-job-error`, or cancel with
+`live-tex-preview-cancel`. `live-tex-preview-image` converts metadata to an
+image spec with optional zoom. The caller chooses how to display it.
+
+```elisp
+;; In a buffer, ENTRIES are (BEG END LATEX) lists.
+(live-tex-preview-place entries
+                        :preamble preamble
+                        :page-width "475pt"
+                        :input-directory project-directory
+                        :cache-directory cache-directory)
+```
+
+Placement returns the same job type and installs previews when results arrive.
+Interactive `live-tex-preview-buffer`, `-region`, `-at-point`, `-clear`,
+`-clear-cache`, and `-mode` are supplied by the TeX frontend.
+
+## Cache and limitations
+
+The TeX frontend defaults to a `.cache` directory beside the main document.
+Only `live-tex-<sha256>.svg` and `.eld` files persist. Each job owns a separate
+temporary directory under the cache and removes it on success, failure or
+cancellation. Metadata is read as data, never evaluated. The cache key includes
+fragment, preamble, page width, input directory, executable settings and format
+version. Cache clearing only removes package-owned files, not the entire shared
+`.cache` directory.
+
+Included preamble files and installed TeX packages are not recursively hashed:
+clear previews' cache after changing those. The preamble and master selection
+are refreshed by explicit preview commands. Macros defined only in the document
+body are not captured. Cache files are not automatically expired; edited
+fragments also use the persistent content cache. An interrupted Emacs process
+can leave a `live-tex-job-*` scratch directory.
+
+This version supports the `latex` → DVI → `dvisvgm` path only. The previous
+optional dvipng compatibility advice was not retained. Remote TeX rendering and
+XeLaTeX/LuaLaTeX-only preambles are not supported. TeX runs with shell escape
+disabled. Newly typed fragments need an initial explicit preview before live
+editing starts, as in the former implementation. The scanner handles configured
+math delimiters and comments, not arbitrary TeX macro expansion or verbatim
+syntax. Deleting a delimiter invalidates its overlay rather than consuming the
+next equation. A failed compilation reports its diagnostics through the job
+callback and leaves source editable. Errors confined to individual fragments
+cause a retry batch of the surviving fragments, so one bad equation does not
+prevent the others from rendering. Results for failed fragments remain nil.
+
+To add Markdown/Quarto later, implement a separate frontend that finds fragments,
+selects a preamble, and supplies the three interaction callbacks. It can pass
+strings to the renderer and `(BEG END LATEX)` entries to placement. No engine
+change is needed. Neither frontend is implemented here.
+
+## Provenance and licensing
+
+Extraction source: GNU Org's `lisp/org-latex-preview.el` from
+<https://git.tecosaur.net/tec/org-mode.git>, commit
+`1ef59f0aa02e3cff40bae68b756a29bc2001739e`, as installed in this repository's
+Doom environment when extracted. Upstream source notice:
+
+> Copyright (C) 2022-2024 Free Software Foundation, Inc.
+> Authors: TEC <contact@tecosaur.net> and Karthik Chikmagalur
+
+TEC is also known as Tecosaur. Modifications, standalone process/cache plumbing,
+and the LaTeX frontend are attributed separately to Jorge Noreña (2026).
+The earlier local `latex-live-preview.el` is the source of the TeX scanner,
+master-file handling and popup refinements.
+
+Substantially derived portions: the `preview.sty` batching template; scaled-point
+geometry and optical correction; currentColor stand-in and font-relative
+height/ascent conventions; cursor pre/post/open/close logic; live-display
+debounce/throttle, string installation and update-hook flow. Org parsing, export,
+numbering tables, persistence, precompilation and its asynchronous task runner
+were not imported. Names have been changed, but upstream authorship and
+copyright have not been replaced.
+
+All package sources use SPDX `GPL-3.0-or-later`. [COPYING](COPYING) contains
+the full GPLv3 text. There is no warranty.
+
+## Verification
+
+```sh
+emacs -Q --batch -L live-tex-preview \
+  -l live-tex-preview/test/live-tex-preview-test.el \
+  -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L live-tex-preview -f batch-byte-compile \
+  live-tex-preview/live-tex-preview-engine.el \
+  live-tex-preview/live-tex-preview.el \
+  live-tex-preview/live-tex-preview-tex.el
+```
+
+Tests cover scanning, comments/escapes, document bounds, master selection,
+number rewriting, sanitization, hashes, actual rendering/cache hits, API shape,
+stale callbacks, delimiter deletion, enter/edit/leave and terminal behavior.
+They also exercise master-file inputs, corrupt/missing cache metadata and
+isolation of malformed fragments in a batch.
+The actual rendering tests require the TeX dependencies above.
+`test/gui-smoke.el` runs a separate graphical smoke test with stable Org;
+launch it with `emacs -Q`, the package and test directories, and posframe on
+`load-path`. It writes `/tmp/live-tex-preview-gui-result.el` and exits. It checks
+image dimensions, timed live updates, inline display, block posframe and text
+scaling without loading the development preview library.
+
+Verified on 2026-09-14: 15/15 ERT tests pass; the three package files byte-compile
+without warnings on Emacs 30.2. The GUI smoke test passed with system Org 9.7.11,
+including inline timed regeneration, cursor leave restoration, posframe and text
+scaling. Full interactive Evil/AUCTeX motion stress testing in the user's normal
+Doom session remains a manual check after `doom sync` and restart.

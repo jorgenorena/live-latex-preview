@@ -1,0 +1,317 @@
+;;; live-tex-preview-engine.el --- Asynchronous TeX to SVG -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2022-2024 Free Software Foundation, Inc.
+;; Copyright (C) 2026 Jorge Noreña
+;; Authors: TEC <contact@tecosaur.net>, Karthik Chikmagalur
+;; Maintainer: Jorge Noreña
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;;; Commentary:
+;; Derived from GNU Org's org-latex-preview.el (preview.sty batching,
+;; geometry conversion, currentColor and image ascent/height conventions).
+;; Source: https://git.tecosaur.net/tec/org-mode.git
+;; Revision: 1ef59f0aa02e3cff40bae68b756a29bc2001739e
+;; Process chaining, job lifetime, persistent metadata and API rewritten by
+;; Jorge Noreña.  No editor UI or major mode is required.
+;; Licensed under GPL version 3 or (at your option) any later version,
+;; WITHOUT ANY WARRANTY.  See COPYING.
+
+;;; Code:
+(require 'cl-lib)
+(require 'subr-x)
+
+(defgroup live-tex-preview-engine nil
+  "Asynchronous TeX rendering."
+  :group 'tex)
+
+(defcustom live-tex-preview-engine-cache-directory
+  (expand-file-name "live-tex-preview/" user-emacs-directory)
+  "Default directory for content-addressed SVGs and geometry metadata."
+  :type 'directory)
+
+(defcustom live-tex-preview-latex-command "latex"
+  "LaTeX executable producing DVI output."
+  :type 'string)
+
+(defcustom live-tex-preview-dvisvgm-command "dvisvgm"
+  "Executable converting DVI pages into SVG."
+  :type 'string)
+
+(defcustom live-tex-preview-process-timeout 60
+  "Maximum seconds allowed for each compilation or conversion process."
+  :type 'number)
+
+(defconst live-tex-preview-engine--format-version 1)
+(defconst live-tex-preview-engine--tex-scale-divisor (* 65781.76 1.01659593)
+  "Upstream preview.sty scaled-point conversion and optical correction.
+The 1.01659593 correction preserves the existing preview sizing.")
+
+(cl-defstruct (live-tex-preview-job (:constructor live-tex-preview--make-job))
+  "One batch; inspect STATUS, RESULTS and ERROR after CALLBACK fires."
+  (status 'pending) results error process timer directory buffers callback
+  strings keys missing cache preamble page-width input-directory environment geometry
+  latex-command dvisvgm-command timeout diagnostics)
+
+(defun live-tex-preview-engine--hash (latex preamble page-width input-directory)
+  "Hash LATEX, PREAMBLE, PAGE-WIDTH and INPUT-DIRECTORY with engine settings.
+Included files are not recursively hashed; clear the cache after editing them."
+  (secure-hash 'sha256
+               (prin1-to-string
+                (list live-tex-preview-engine--format-version latex preamble
+                      page-width input-directory live-tex-preview-latex-command
+                      live-tex-preview-dvisvgm-command))))
+
+(defun live-tex-preview-engine--cached (key directory)
+  "Read and validate KEY's metadata in DIRECTORY, without evaluating Lisp."
+  (let ((svg (expand-file-name (concat "live-tex-" key ".svg") directory))
+        (meta (expand-file-name (concat "live-tex-" key ".eld") directory)))
+    (when (and (file-regular-p svg) (file-regular-p meta))
+      (condition-case nil
+          (let ((info (with-temp-buffer
+                        (insert-file-contents meta)
+                        (read (current-buffer)))))
+            (when (and (equal (plist-get info :key) key)
+                       (cl-every (lambda (p) (numberp (plist-get info p)))
+                                 '(:height :depth :width))
+                       (> (plist-get info :height) 0)
+                       (> (plist-get info :width) 0)
+                       (<= 0 (plist-get info :depth) (plist-get info :height)))
+              (plist-put info :file svg)))
+        (error nil)))))
+
+(defun live-tex-preview-image (metadata &optional zoom)
+  "Return an Emacs image spec from renderer METADATA at optional ZOOM.
+Dimensions in metadata are font-relative em units.  Creating this spec does
+not require image support or a graphical frame.  SVG currentColor follows
+the face on the displaying text."
+  (let ((height (plist-get metadata :height))
+        (depth (plist-get metadata :depth)))
+    (list 'image :type 'svg :file (plist-get metadata :file)
+          :height (cons (* height (or zoom 1.0)) 'em)
+          :ascent (max 0 (min 100 (round (* 100 (- 1 (/ (max 0.0 (- depth 0.02))
+                                                       height)))))))))
+
+(defun live-tex-preview-engine--finish (job status &optional error-text)
+  "Finish JOB with STATUS and ERROR-TEXT, clean scratch data, notify once."
+  (unless (memq (live-tex-preview-job-status job) '(done failed cancelled))
+    (setf (live-tex-preview-job-status job) status
+          (live-tex-preview-job-error job) error-text)
+    (when (timerp (live-tex-preview-job-timer job))
+      (cancel-timer (live-tex-preview-job-timer job)))
+    (when (process-live-p (live-tex-preview-job-process job))
+      (delete-process (live-tex-preview-job-process job)))
+    (dolist (buffer (live-tex-preview-job-buffers job))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))
+    ;; DIRECTORY is exclusively a make-temp-file directory owned by this job.
+    (when-let ((directory (live-tex-preview-job-directory job)))
+      (when (file-directory-p directory) (delete-directory directory t)))
+    (when-let ((callback (live-tex-preview-job-callback job)))
+      (condition-case err
+          (funcall callback (live-tex-preview-job-results job) error-text)
+        (error (message "live-tex-preview callback: %s" (error-message-string err)))))))
+
+(defun live-tex-preview-cancel (job)
+  "Cancel JOB and invoke its callback once with a cancellation error."
+  (live-tex-preview-engine--finish job 'cancelled "Rendering cancelled"))
+
+(defun live-tex-preview-engine--run (job command continuation)
+  "Run COMMAND for JOB and call CONTINUATION with exit code and output."
+  (let* ((default-directory (live-tex-preview-job-directory job))
+         (process-environment (live-tex-preview-job-environment job))
+         (buffer (generate-new-buffer " *live-tex-preview-process*")))
+    (push buffer (live-tex-preview-job-buffers job))
+    (setf (live-tex-preview-job-process job)
+          (make-process
+           :name "live-tex-preview" :buffer buffer :command command
+           :connection-type 'pipe :noquery t :coding 'utf-8-unix
+           :sentinel
+           (lambda (process _event)
+             (when (and (memq (process-status process) '(exit signal))
+                        (not (memq (live-tex-preview-job-status job)
+                                   '(done failed cancelled))))
+               (when (timerp (live-tex-preview-job-timer job))
+                 (cancel-timer (live-tex-preview-job-timer job)))
+               (condition-case err
+                   (funcall continuation (process-exit-status process)
+                            (with-current-buffer buffer (buffer-string)))
+                 (error (live-tex-preview-engine--finish
+                         job 'failed (error-message-string err))))))))
+    (setf (live-tex-preview-job-timer job)
+          (run-at-time (live-tex-preview-job-timeout job) nil
+                       #'live-tex-preview-engine--finish job 'failed
+                       "TeX rendering process timed out"))))
+
+(defun live-tex-preview-engine--geometry (output)
+  "Parse preview.sty OUTPUT into ordered em geometry plists.
+Adapted from upstream's preview log parser; process completion removes the
+need for partial-line filters.  Tightpage padding is included in all sizes."
+  (with-temp-buffer
+    (insert output)
+    (goto-char (point-min))
+    (let ((font 10) (margins '(0 0 0 0)) result)
+      (when (re-search-forward "^Preview: Fontsize \\([0-9.]+\\)pt" nil t)
+        (setq font (string-to-number (match-string 1))))
+      (goto-char (point-min))
+      (when (re-search-forward
+             "^Preview: Tightpage \\(-?[0-9]+\\) +\\(-?[0-9]+\\) +\\(-?[0-9]+\\) +\\(-?[0-9]+\\)" nil t)
+        (setq margins (mapcar (lambda (n) (string-to-number (match-string n))) '(1 2 3 4))))
+      (goto-char (point-min))
+      (while (re-search-forward
+              "! Preview: Snippet \\([0-9]+\\) ended.(\\([0-9]+\\)[+]\\([0-9]+\\)x\\([0-9]+\\))" nil t)
+        (let* ((page (string-to-number (match-string 1)))
+               (h (string-to-number (match-string 2)))
+               (d (string-to-number (match-string 3)))
+               (w (string-to-number (match-string 4)))
+               (divisor (* font live-tex-preview-engine--tex-scale-divisor))
+               (depth (/ (- d (nth 1 margins)) divisor)))
+          (push (cons page (list :height (+ depth (/ (+ h (nth 3 margins)) divisor))
+                                :depth depth
+                                :width (/ (- (+ w (nth 2 margins)) (nth 0 margins)) divisor)))
+                result)))
+      (nreverse result))))
+
+(defun live-tex-preview-engine--errors (output)
+  "Return (PAGE . MESSAGE) entries for real TeX errors in OUTPUT.
+PAGE is nil for preamble or document-level failures.  The synthetic preview
+errors delimit fragments but do not themselves indicate failure."
+  (let (page errors)
+    (dolist (line (split-string output "\n"))
+      (cond
+       ((string-match "^! Preview: Snippet \\([0-9]+\\) started" line)
+        (setq page (string-to-number (match-string 1 line))))
+       ((string-prefix-p "! Preview: Snippet" line) (setq page nil))
+       ((string-prefix-p "! " line) (push (cons page line) errors))))
+    (nreverse errors)))
+
+(defun live-tex-preview-engine--publish (job)
+  "Publish converted images and geometry for JOB atomically per file."
+  (cl-loop for index in (live-tex-preview-job-missing job)
+           for page from 1
+           for key = (nth index (live-tex-preview-job-keys job))
+           for svg = (expand-file-name (format "preview-%d.svg" page)
+                                       (live-tex-preview-job-directory job))
+           for info = (copy-sequence (cdr (assq page (live-tex-preview-job-geometry job))))
+           do
+           (unless (and info (file-regular-p svg)
+                        (> (plist-get info :height) 0) (> (plist-get info :width) 0))
+             (error "Missing image or geometry for fragment %d" (1+ index)))
+           (with-temp-buffer
+             (insert-file-contents svg)
+             (goto-char (point-min))
+             (unless (search-forward "</svg>" nil t) (error "Incomplete SVG"))
+             (goto-char (point-min))
+             (while (search-forward "#000001" nil t)
+               (replace-match "currentColor" t t))
+             (write-region (point-min) (point-max) svg nil 'silent))
+           (let* ((destination (expand-file-name (concat "live-tex-" key ".svg")
+                                                (live-tex-preview-job-cache job)))
+                  (metadata-file (concat (file-name-sans-extension destination) ".eld"))
+                  (scratch (expand-file-name (format "metadata-%d.eld" page)
+                                             (live-tex-preview-job-directory job))))
+             (setq info (append (list :key key :file destination :image-type 'svg) info))
+             (rename-file svg destination t)
+             (with-temp-file scratch (prin1 info (current-buffer)))
+             (rename-file scratch metadata-file t)
+             (aset (live-tex-preview-job-results job) index info)))
+  (live-tex-preview-engine--finish
+   job (if (live-tex-preview-job-diagnostics job) 'failed 'done)
+   (live-tex-preview-job-diagnostics job)))
+
+(defun live-tex-preview-engine--start (job)
+  "Start uncached work in JOB, or report asynchronous cache completion."
+  (unless (eq (live-tex-preview-job-status job) 'cancelled)
+    (condition-case err
+        (if (null (live-tex-preview-job-missing job))
+            (live-tex-preview-engine--finish
+             job (if (live-tex-preview-job-diagnostics job) 'failed 'done)
+             (live-tex-preview-job-diagnostics job))
+          (when-let ((old-directory (live-tex-preview-job-directory job)))
+            (when (file-directory-p old-directory) (delete-directory old-directory t)))
+          (setf (live-tex-preview-job-status job) 'running
+                (live-tex-preview-job-directory job)
+                (make-temp-file (expand-file-name "live-tex-job-" (live-tex-preview-job-cache job)) t))
+          (let ((texfile (expand-file-name "preview.tex" (live-tex-preview-job-directory job)))
+                (width (live-tex-preview-job-page-width job)))
+            (with-temp-file texfile
+              (insert (live-tex-preview-job-preamble job)
+                      "\n\\usepackage{xcolor}\n"
+                      "\\usepackage[active,tightpage,auctex,dvips]{preview}\n")
+              (when width
+                (insert (format "\\setlength{\\textwidth}{%s}\n"
+                                (if (numberp width) (format "%s\\paperwidth" width) width))))
+              (insert "\\begin{document}\n\\setlength\\abovedisplayskip{0pt}\n")
+              (dolist (index (live-tex-preview-job-missing job))
+                (insert "\\begin{preview}\n\\color[HTML]{000001}\n"
+                        (nth index (live-tex-preview-job-strings job))
+                        "\n\\end{preview}\n"))
+              (insert "\\end{document}\n"))
+            (live-tex-preview-engine--run
+             job (list (live-tex-preview-job-latex-command job) "-interaction=nonstopmode"
+                       "-no-shell-escape" "preview.tex")
+             (lambda (code output)
+               ;; preview.sty's auctex option deliberately emits TeX errors.
+               (unless (and (memq code '(0 1))
+                            (file-exists-p (expand-file-name "preview.dvi" (live-tex-preview-job-directory job))))
+                 (error "LaTeX failed (%d):\n%s" code output))
+               (let ((errors (live-tex-preview-engine--errors output)))
+                 (if errors
+                     (progn
+                       (when (assq nil errors) (error "LaTeX preamble/document errors:\n%s" output))
+                       ;; Rebatch the surviving fragments.  This also avoids
+                       ;; misnumbering physical DVI pages after empty/bad math.
+                       (setf (live-tex-preview-job-diagnostics job) (concat "LaTeX errors:\n" output)
+                             (live-tex-preview-job-missing job)
+                             (cl-loop for index in (live-tex-preview-job-missing job)
+                                      for page from 1 unless (assq page errors) collect index))
+                       (live-tex-preview-engine--start job))
+                   (setf (live-tex-preview-job-geometry job) (live-tex-preview-engine--geometry output))
+                   (live-tex-preview-engine--run
+                    job (list (live-tex-preview-job-dvisvgm-command job) "--page=1-" "--bbox=preview"
+                              "--no-fonts" "--exact" "--output=preview-%p.svg" "preview.dvi")
+                    (lambda (exit log)
+                      (unless (= exit 0) (error "dvisvgm failed (%d):\n%s" exit log))
+                      (live-tex-preview-engine--publish job)))))))))
+      (error (live-tex-preview-engine--finish job 'failed (error-message-string err))))))
+
+(cl-defun live-tex-preview-render (strings callback &key preamble page-width
+                                          cache-directory input-directory)
+  "Asynchronously render LaTeX STRINGS and return a `live-tex-preview-job'.
+CALLBACK is called once as (CALLBACK RESULTS ERROR), even for cache hits.
+RESULTS is a vector in input order of metadata plists (:file :key :image-type
+:height :depth :width); unproduced entries are nil.  ERROR is nil on success
+or a diagnostic string.  Height (including depth), depth and width use em.
+PREAMBLE defaults to article with AMS math.  PAGE-WIDTH is a TeX dimension,
+a fraction of paper width, or nil.  CACHE-DIRECTORY stores images and metadata;
+INPUT-DIRECTORY resolves relative TeX inputs.  All settings and process
+environment are captured before returning.  No source buffer, overlay, Org,
+Doom, major mode, or graphical frame is required.  Use
+`live-tex-preview-cancel' to cancel a job."
+  (unless (and (listp strings) (cl-every #'stringp strings) (functionp callback))
+    (error "Expected a list of LaTeX strings and a callback"))
+  (let* ((preamble (or preamble "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n"))
+         (input (file-name-as-directory (expand-file-name (or input-directory default-directory))))
+         (cache (file-name-as-directory (expand-file-name (or cache-directory live-tex-preview-engine-cache-directory))))
+         (keys (mapcar (lambda (s) (live-tex-preview-engine--hash s preamble page-width input)) strings))
+         (results (make-vector (length strings) nil)) missing)
+    (when (or (file-remote-p input) (file-remote-p cache))
+      (user-error "Remote TeX rendering is not supported"))
+    (make-directory cache t)
+    (cl-loop for key in keys for i from 0
+             do (if-let ((info (live-tex-preview-engine--cached key cache)))
+                    (aset results i info)
+                  (push i missing)))
+    (let ((job (live-tex-preview--make-job
+                :results results :callback callback :strings (copy-sequence strings)
+                :keys keys :missing (nreverse missing) :cache cache :preamble preamble
+                :page-width page-width :input-directory input
+                :latex-command live-tex-preview-latex-command
+                :dvisvgm-command live-tex-preview-dvisvgm-command
+                :timeout live-tex-preview-process-timeout
+                :environment (cons (concat "TEXINPUTS=" input path-separator (or (getenv "TEXINPUTS") ""))
+                                   (copy-sequence process-environment)))))
+      (setf (live-tex-preview-job-timer job)
+            (run-at-time 0 nil #'live-tex-preview-engine--start job))
+      job)))
+
+(provide 'live-tex-preview-engine)
+;;; live-tex-preview-engine.el ends here
