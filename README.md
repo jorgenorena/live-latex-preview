@@ -4,6 +4,22 @@ Personal Emacs package for asynchronous math previews in TeX, Markdown and Quart
 GPL-3.0-or-later. This is an extracted and maintained personal implementation,
 not a MELPA release.
 
+## Literate source
+
+[`live-tex-preview.org`](live-tex-preview.org) is the source of truth for the
+implementation, tests, GUI smoke programs, and developer helper. The generated
+`.el` files remain ordinary loadable package files and do not add an Org runtime
+dependency. Edit the Org file and regenerate artifacts with:
+
+```sh
+./literate tangle
+```
+
+`./literate check-tangle` verifies generated files without rewriting the working
+tree. `./literate test` runs the focused TeX/engine suite, and
+`./literate check` performs both checks. Markdown/Polymode tests still require
+their optional packages on `load-path`, as described under Verification.
+
 ## Architecture
 
 - `live-tex-preview-engine.el`: asynchronous string-to-SVG rendering, batch
