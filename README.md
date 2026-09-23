@@ -88,6 +88,11 @@ The development-only automatic Org preview minor mode is no longer enabled.
 Existing LaTeX localleader keys are preserved: `v v` toggle live interaction,
 `v P` preview buffer, `v p` preview at point, `v c` clear previews, `v C` clear
 cached images. The raw-TeX toggle uses the new commands too.
+Interactive placement fits oversized previews inside the visible text area and
+realizes off-screen SVGs lazily by default. These safeguards are especially
+important when `visual-fill-column-mode`, `mixed-pitch-mode`, and preview zoom
+are used together. They can be customized with `live-tex-preview-fit-to-window`,
+`live-tex-preview-fit-window-margin`, and `live-tex-preview-lazy-display`.
 Markdown/Quarto host buffers use the same `v` bindings. Loading the old
 `live-tex-preview-tex` feature still works; commands now dispatch in the common
 library. A TeX mode hook firing in a Quarto indirect buffer cannot enable a TeX
@@ -168,7 +173,8 @@ asynchronously even for cache hits. Each result is a plist with `:file`, `:key`,
 height includes depth and padding. Unproduced entries are nil. Inspect
 `live-tex-preview-job-status` / `live-tex-preview-job-error`, or cancel with
 `live-tex-preview-cancel`. `live-tex-preview-image` converts metadata to an
-image spec with optional zoom. The caller chooses how to display it.
+image spec with optional zoom and maximum pixel width. The caller chooses how
+to display it.
 
 ```elisp
 ;; In a buffer, ENTRIES are (BEG END LATEX) lists.

@@ -63,6 +63,27 @@
                     ("$x$" "p" "300pt" "/tmp/") ("$x$" "p" "475pt" "/other/")))
       (should-not (equal key (apply #'live-tex-preview-engine--hash args))))))
 
+(ert-deftest live-tex-preview-test-window-bounded-image ()
+  (let* ((info '(:file "/tmp/equation.svg" :height 2.0 :depth 0.25 :width 40.0))
+         (spec (live-tex-preview-image info 1.2 640))
+         (properties (cdr spec)))
+    (should (equal (plist-get properties :height) '(2.4 . em)))
+    (should (= (plist-get properties :max-width) 640)))
+  (with-temp-buffer
+    (let ((live-tex-preview-fit-to-window t)
+          (live-tex-preview-fit-window-margin 2))
+      (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) 'window))
+                ((symbol-function 'window-body-width)
+                 (lambda (window pixelwise)
+                   (should (eq window 'window))
+                   (should pixelwise)
+                   900))
+                ((symbol-function 'window-frame) (lambda (_) 'frame))
+                ((symbol-function 'frame-char-width) (lambda (_) 10)))
+        (should (= (live-tex-preview--image-max-width) 880))))
+    (let ((live-tex-preview-fit-to-window nil))
+      (should-not (live-tex-preview--image-max-width)))))
+
 (ert-deftest live-tex-preview-test-terminal ()
   (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () nil)))
     (with-temp-buffer
@@ -155,6 +176,27 @@
               (live-tex-preview-mode -1)
               (should-not live-tex-preview--jobs)
               (should-not live-tex-preview--timers))))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-multipage-output-names ()
+  "Render enough pages to exercise dvisvgm's implicit padding boundary."
+  (skip-unless (and (executable-find "latex") (executable-find "dvisvgm")))
+  (let ((directory (make-temp-file "live-tex-multipage-test-" t)) results)
+    (unwind-protect
+        (let* ((strings (cl-loop for n below 12 collect (format "$x_{%d}$" n)))
+               (job (live-tex-preview-render
+                     strings
+                     (lambda (rendered error-text)
+                       (should-not error-text)
+                       (setq results rendered))
+                     :cache-directory directory
+                     :input-directory directory)))
+          (live-tex-preview-test--await job)
+          (should (= (length results) 12))
+          (should (cl-every (lambda (info)
+                              (and info (file-regular-p (plist-get info :file))))
+                            (append results nil)))
+          (should-not (directory-files directory nil "live-tex-job-")))
       (delete-directory directory t))))
 
 (ert-deftest live-tex-preview-test-cancellation-and-errors ()

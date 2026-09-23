@@ -32,6 +32,8 @@
 (defvar-local live-tex-preview--timers nil)
 (defvar live-tex-preview-overlay-priority)
 (defvar live-tex-preview-fragment-function)
+(defvar live-tex-preview-fit-to-window)
+(defvar live-tex-preview-fit-window-margin)
 (defcustom live-tex-preview-zoom 1.0
   "Font-relative display zoom; independent of compiled cache contents."
   :type 'number :group 'live-tex-preview-engine)
@@ -57,6 +59,19 @@
         (dolist (hook '(modification-hooks insert-in-front-hooks insert-behind-hooks))
           (overlay-put ov hook '(live-tex-preview--mark-modified)))
         ov)))
+
+(defun live-tex-preview--image-max-width ()
+  "Return a safe image width in pixels for the current buffer's window.
+The text area's width excludes margins installed by packages such as
+visual-fill-column.  Leave a small character-cell margin so an image at the
+wrapping boundary cannot make redisplay alternate between two layouts."
+  (when live-tex-preview-fit-to-window
+    (when-let ((window (if (eq (window-buffer (selected-window)) (current-buffer))
+                           (selected-window)
+                         (get-buffer-window (current-buffer) t))))
+      (max 1 (- (window-body-width window t)
+                (* live-tex-preview-fit-window-margin
+                   (frame-char-width (window-frame window))))))))
 
 (cl-defun live-tex-preview-place (entries &key preamble page-width cache-directory input-directory)
   "Render (BEG END LATEX) ENTRIES and place previews in the current buffer.
@@ -98,7 +113,9 @@ buffer-local fragment, render and block callback variables below."
 				(progn
                                   (overlay-put ov 'help-echo error-text)
                                   (overlay-put ov 'live-tex-preview-state 'modified))
-                              (let ((image (live-tex-preview-image info live-tex-preview-zoom))
+                              (let ((image (live-tex-preview-image
+                                            info live-tex-preview-zoom
+                                            (live-tex-preview--image-max-width)))
                                     (face (or (and (> (overlay-start ov) (point-min))
                                                    (get-text-property (1- (overlay-start ov)) 'face))
                                               'default)))
@@ -166,7 +183,22 @@ inline math in folded section titles."
                  (integer :tag "Overlay priority"))
   :group 'live-tex-preview)
 
-(defcustom live-tex-preview-lazy-display nil
+(defcustom live-tex-preview-fit-to-window t
+  "When non-nil, shrink previews that exceed the visible text area.
+The requested `live-tex-preview-zoom' remains the preferred size.  Emacs only
+scales an image down when that size would cross the window's text boundary."
+  :type 'boolean
+  :group 'live-tex-preview)
+
+(defcustom live-tex-preview-fit-window-margin 10
+  "Character cells kept free when fitting preview images to a window.
+The reserve is deliberately wider than a wrap glyph: mixed-pitch and centered
+text can otherwise leave an SVG close enough to the boundary for Emacs 30
+redisplay to alternate layouts."
+  :type 'integer
+  :group 'live-tex-preview)
+
+(defcustom live-tex-preview-lazy-display t
   "When non-nil, only display rendered previews near visible windows.
 The image files and overlay metadata are still generated for every requested
 fragment.  Off-screen overlays retain image metadata without an active

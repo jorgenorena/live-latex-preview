@@ -81,17 +81,21 @@ Included files are not recursively hashed; clear the cache after editing them."
               (plist-put info :file svg)))
         (error nil)))))
 
-(defun live-tex-preview-image (metadata &optional zoom)
+(defun live-tex-preview-image (metadata &optional zoom max-width)
   "Return an Emacs image spec from renderer METADATA at optional ZOOM.
 Dimensions in metadata are font-relative em units.  Creating this spec does
 not require image support or a graphical frame.  SVG currentColor follows
-the face on the displaying text."
+the face on the displaying text.  When MAX-WIDTH is a positive pixel count,
+ask Emacs to preserve aspect ratio while keeping the image within that width."
   (let ((height (plist-get metadata :height))
         (depth (plist-get metadata :depth)))
-    (list 'image :type 'svg :file (plist-get metadata :file)
-          :height (cons (* height (or zoom 1.0)) 'em)
-          :ascent (max 0 (min 100 (round (* 100 (- 1 (/ (max 0.0 (- depth 0.02))
-                                                       height)))))))))
+    (append
+     (list 'image :type 'svg :file (plist-get metadata :file)
+           :height (cons (* height (or zoom 1.0)) 'em)
+           :ascent (max 0 (min 100 (round (* 100 (- 1 (/ (max 0.0 (- depth 0.02))
+                                                        height)))))))
+     (when (and (numberp max-width) (> max-width 0))
+       (list :max-width max-width)))))
 
 (defun live-tex-preview-engine--finish (job status &optional error-text)
   "Finish JOB with STATUS and ERROR-TEXT, clean scratch data, notify once."
@@ -269,7 +273,7 @@ errors delimit fragments but do not themselves indicate failure."
                    (setf (live-tex-preview-job-geometry job) (live-tex-preview-engine--geometry output))
                    (live-tex-preview-engine--run
                     job (list (live-tex-preview-job-dvisvgm-command job) "--page=1-" "--bbox=preview"
-                              "--no-fonts" "--exact" "--output=preview-%p.svg" "preview.dvi")
+                              "--no-fonts" "--exact" "--output=preview-%1p.svg" "preview.dvi")
                     (lambda (exit log)
                       (unless (= exit 0) (error "dvisvgm failed (%d):\n%s" exit log))
                       (live-tex-preview-engine--publish job)))))))))

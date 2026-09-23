@@ -178,17 +178,21 @@ Included files are not recursively hashed; clear the cache after editing them."
               (plist-put info :file svg)))
         (error nil)))))
 
-(defun live-tex-preview-image (metadata &optional zoom)
+(defun live-tex-preview-image (metadata &optional zoom max-width)
   "Return an Emacs image spec from renderer METADATA at optional ZOOM.
 Dimensions in metadata are font-relative em units.  Creating this spec does
 not require image support or a graphical frame.  SVG currentColor follows
-the face on the displaying text."
+the face on the displaying text.  When MAX-WIDTH is a positive pixel count,
+ask Emacs to preserve aspect ratio while keeping the image within that width."
   (let ((height (plist-get metadata :height))
         (depth (plist-get metadata :depth)))
-    (list 'image :type 'svg :file (plist-get metadata :file)
-          :height (cons (* height (or zoom 1.0)) 'em)
-          :ascent (max 0 (min 100 (round (* 100 (- 1 (/ (max 0.0 (- depth 0.02))
-                                                       height)))))))))
+    (append
+     (list 'image :type 'svg :file (plist-get metadata :file)
+           :height (cons (* height (or zoom 1.0)) 'em)
+           :ascent (max 0 (min 100 (round (* 100 (- 1 (/ (max 0.0 (- depth 0.02))
+                                                        height)))))))
+     (when (and (numberp max-width) (> max-width 0))
+       (list :max-width max-width)))))
 
 #+end_src
 
@@ -300,7 +304,12 @@ errors delimit fragments but do not themselves indicate failure."
 
 ** Publishing atomically
 
-Conversion output is validated before publication.  The nearly-black stand-in is rewritten to SVG =currentColor=, preserving explicit LaTeX colors while allowing ordinary math to follow the Emacs face.  Renames publish each image and metadata record atomically.
+Conversion output is validated before publication.  The converter is given an
+explicit one-digit minimum (=%1p=) so its page filenames never acquire implicit
+zero padding when a batch reaches 10 or 100 pages.  The nearly-black stand-in is
+rewritten to SVG =currentColor=, preserving explicit LaTeX colors while allowing
+ordinary math to follow the Emacs face.  Renames publish each image and metadata
+record atomically.
 
 #+begin_src emacs-lisp :tangle live-tex-preview-engine.el
 (defun live-tex-preview-engine--publish (job)
@@ -394,7 +403,7 @@ One generated document contains every uncached fragment.  If TeX identifies frag
                    (setf (live-tex-preview-job-geometry job) (live-tex-preview-engine--geometry output))
                    (live-tex-preview-engine--run
                     job (list (live-tex-preview-job-dvisvgm-command job) "--page=1-" "--bbox=preview"
-                              "--no-fonts" "--exact" "--output=preview-%p.svg" "preview.dvi")
+                              "--no-fonts" "--exact" "--output=preview-%1p.svg" "preview.dvi")
                     (lambda (exit log)
                       (unless (= exit 0) (error "dvisvgm failed (%d):\n%s" exit log))
                       (live-tex-preview-engine--publish job)))))))))
@@ -494,6 +503,8 @@ Placement creates or reuses source overlays and records a generation/source snap
 (defvar-local live-tex-preview--timers nil)
 (defvar live-tex-preview-overlay-priority)
 (defvar live-tex-preview-fragment-function)
+(defvar live-tex-preview-fit-to-window)
+(defvar live-tex-preview-fit-window-margin)
 (defcustom live-tex-preview-zoom 1.0
   "Font-relative display zoom; independent of compiled cache contents."
   :type 'number :group 'live-tex-preview-engine)
@@ -519,6 +530,19 @@ Placement creates or reuses source overlays and records a generation/source snap
         (dolist (hook '(modification-hooks insert-in-front-hooks insert-behind-hooks))
           (overlay-put ov hook '(live-tex-preview--mark-modified)))
         ov)))
+
+(defun live-tex-preview--image-max-width ()
+  "Return a safe image width in pixels for the current buffer's window.
+The text area's width excludes margins installed by packages such as
+visual-fill-column.  Leave a small character-cell margin so an image at the
+wrapping boundary cannot make redisplay alternate between two layouts."
+  (when live-tex-preview-fit-to-window
+    (when-let ((window (if (eq (window-buffer (selected-window)) (current-buffer))
+                           (selected-window)
+                         (get-buffer-window (current-buffer) t))))
+      (max 1 (- (window-body-width window t)
+                (* live-tex-preview-fit-window-margin
+                   (frame-char-width (window-frame window))))))))
 
 (cl-defun live-tex-preview-place (entries &key preamble page-width cache-directory input-directory)
   "Render (BEG END LATEX) ENTRIES and place previews in the current buffer.
@@ -560,7 +584,9 @@ buffer-local fragment, render and block callback variables below."
 				(progn
                                   (overlay-put ov 'help-echo error-text)
                                   (overlay-put ov 'live-tex-preview-state 'modified))
-                              (let ((image (live-tex-preview-image info live-tex-preview-zoom))
+                              (let ((image (live-tex-preview-image
+                                            info live-tex-preview-zoom
+                                            (live-tex-preview--image-max-width)))
                                     (face (or (and (> (overlay-start ov) (point-min))
                                                    (get-text-property (1- (overlay-start ov)) 'face))
                                               'default)))
@@ -631,7 +657,13 @@ buffer-local fragment, render and block callback variables below."
 
 ** Display policy
 
-Customization separates persistent rendering from presentation: priority, lazy realization, live contexts, popup geometry, edit debounce, and motion commands can change without invalidating cached SVGs.  Block previews default to a child frame because large overlay strings can destabilize visual-line motion.
+Customization separates persistent rendering from presentation: priority,
+window fitting, lazy realization, live contexts, popup geometry, edit debounce,
+and motion commands can change without invalidating cached SVGs.  Static images
+are bounded to the text area: an oversized image can otherwise make Emacs 30's
+redisplay loop allocate without bound when visual-fill-column and mixed-pitch
+are active together.  Block live previews default to a child frame because
+large overlay strings can destabilize visual-line motion.
 
 #+begin_src emacs-lisp :tangle live-tex-preview.el
 (defcustom live-tex-preview-overlay-priority 20
@@ -642,7 +674,22 @@ inline math in folded section titles."
                  (integer :tag "Overlay priority"))
   :group 'live-tex-preview)
 
-(defcustom live-tex-preview-lazy-display nil
+(defcustom live-tex-preview-fit-to-window t
+  "When non-nil, shrink previews that exceed the visible text area.
+The requested `live-tex-preview-zoom' remains the preferred size.  Emacs only
+scales an image down when that size would cross the window's text boundary."
+  :type 'boolean
+  :group 'live-tex-preview)
+
+(defcustom live-tex-preview-fit-window-margin 10
+  "Character cells kept free when fitting preview images to a window.
+The reserve is deliberately wider than a wrap glyph: mixed-pitch and centered
+text can otherwise leave an SVG close enough to the boundary for Emacs 30
+redisplay to alternate layouts."
+  :type 'integer
+  :group 'live-tex-preview)
+
+(defcustom live-tex-preview-lazy-display t
   "When non-nil, only display rendered previews near visible windows.
 The image files and overlay metadata are still generated for every requested
 fragment.  Off-screen overlays retain image metadata without an active
@@ -2519,6 +2566,27 @@ Cache tests require stable content identity and inert metadata.  UI tests exerci
                     ("$x$" "p" "300pt" "/tmp/") ("$x$" "p" "475pt" "/other/")))
       (should-not (equal key (apply #'live-tex-preview-engine--hash args))))))
 
+(ert-deftest live-tex-preview-test-window-bounded-image ()
+  (let* ((info '(:file "/tmp/equation.svg" :height 2.0 :depth 0.25 :width 40.0))
+         (spec (live-tex-preview-image info 1.2 640))
+         (properties (cdr spec)))
+    (should (equal (plist-get properties :height) '(2.4 . em)))
+    (should (= (plist-get properties :max-width) 640)))
+  (with-temp-buffer
+    (let ((live-tex-preview-fit-to-window t)
+          (live-tex-preview-fit-window-margin 2))
+      (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) 'window))
+                ((symbol-function 'window-body-width)
+                 (lambda (window pixelwise)
+                   (should (eq window 'window))
+                   (should pixelwise)
+                   900))
+                ((symbol-function 'window-frame) (lambda (_) 'frame))
+                ((symbol-function 'frame-char-width) (lambda (_) 10)))
+        (should (= (live-tex-preview--image-max-width) 880))))
+    (let ((live-tex-preview-fit-to-window nil))
+      (should-not (live-tex-preview--image-max-width)))))
+
 (ert-deftest live-tex-preview-test-terminal ()
   (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () nil)))
     (with-temp-buffer
@@ -2611,6 +2679,27 @@ Cache tests require stable content identity and inert metadata.  UI tests exerci
               (live-tex-preview-mode -1)
               (should-not live-tex-preview--jobs)
               (should-not live-tex-preview--timers))))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-multipage-output-names ()
+  "Render enough pages to exercise dvisvgm's implicit padding boundary."
+  (skip-unless (and (executable-find "latex") (executable-find "dvisvgm")))
+  (let ((directory (make-temp-file "live-tex-multipage-test-" t)) results)
+    (unwind-protect
+        (let* ((strings (cl-loop for n below 12 collect (format "$x_{%d}$" n)))
+               (job (live-tex-preview-render
+                     strings
+                     (lambda (rendered error-text)
+                       (should-not error-text)
+                       (setq results rendered))
+                     :cache-directory directory
+                     :input-directory directory)))
+          (live-tex-preview-test--await job)
+          (should (= (length results) 12))
+          (should (cl-every (lambda (info)
+                              (and info (file-regular-p (plist-get info :file))))
+                            (append results nil)))
+          (should-not (directory-files directory nil "live-tex-job-")))
       (delete-directory directory t))))
 
 #+end_src
