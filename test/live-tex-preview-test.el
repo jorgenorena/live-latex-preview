@@ -55,7 +55,6 @@
     (let ((default-directory "/tmp/"))
       (should (equal (live-tex-preview--compute-main-file) "/tmp/main.tex")))))
 
-
 (ert-deftest live-tex-preview-test-includegraphics-at-point ()
   (live-tex-preview-test--buffer
       "before \\includegraphics[width=.7\\textwidth]{figures/power-spectrum} after"
