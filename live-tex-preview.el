@@ -1188,7 +1188,7 @@ Set to nil to leave the document class's text width unchanged."
                          (expand-file-name live-tex-preview-cache-directory (funcall live-tex-preview-directory-function))
                        live-tex-preview-engine-cache-directory))
           (files (and (file-directory-p directory)
-                      (directory-files directory t "\\`live-tex-[[:xdigit:]]\\{64\\}\\.\\(?:svg\\|eld\\)\\'"))))
+                      (directory-files directory t "\\`live-tex-\\(?:figure-\\)?[[:xdigit:]]\\{64\\}\\.\\(?:svg\\|eld\\)\\'"))))
      (when (and files (yes-or-no-p (format "Delete %d preview cache files in %s? " (length files) directory)))
        (live-tex-preview--cleanup)
        (live-tex-preview-clear)
