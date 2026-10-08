@@ -280,7 +280,6 @@ there is not enough room above.  `below' uses the ordinary below-point handler."
                  (const :tag "Below point, fallback above" below))
   :group 'live-tex-preview)
 
-
 (defcustom live-tex-preview-figure-preview t
   "When non-nil, show a popup while point is on a TeX includegraphics command.
 Raster/SVG files are displayed directly.  PDF page 1 is converted
@@ -763,7 +762,6 @@ When OV is non-nil, hide only if OV owns the current popup."
            ;; dark.  Match the source buffer instead.
            :background-color (face-background 'default nil t)
            :foreground-color (face-foreground 'default nil t)))))))
-
 
 (defun live-tex-preview-live--show-text-popup (owner text)
   "Show TEXT in the child-frame popup, owned by OWNER."
