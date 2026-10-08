@@ -44,7 +44,6 @@
   :type '(repeat string)
   :group 'live-tex-preview)
 
-
 (defcustom live-tex-preview-figure-extensions
   '(".pdf" ".png" ".jpg" ".jpeg" ".svg")
   "Extensions tried, in order, for extensionless includegraphics paths.
@@ -323,7 +322,6 @@ file-local variable; AUCTeX's `TeX-master-file'; finally this file itself."
      (or (and main (file-name-directory main))
          (and buffer-file-name (file-name-directory buffer-file-name))
          default-directory))))
-
 
 (defun live-tex-preview--parse-includegraphics-at (start)
   "Parse an includegraphics command beginning at START.
