@@ -55,6 +55,81 @@
     (let ((default-directory "/tmp/"))
       (should (equal (live-tex-preview--compute-main-file) "/tmp/main.tex")))))
 
+
+(ert-deftest live-tex-preview-test-includegraphics-at-point ()
+  (live-tex-preview-test--buffer
+      "before \\includegraphics[width=.7\\textwidth]{figures/power-spectrum} after"
+    (goto-char (point-min))
+    (search-forward "power-spectrum")
+    (let ((entry (live-tex-preview--includegraphics-at-point (point))))
+      (should entry)
+      (should (equal (plist-get entry :argument) "figures/power-spectrum"))
+      (should (< (plist-get entry :beg) (point)))
+      (should (> (plist-get entry :end) (point)))))
+  (live-tex-preview-test--buffer
+      "% \\includegraphics{ignored}\ntext"
+    (goto-char (point-min))
+    (search-forward "ignored")
+    (should-not (live-tex-preview--includegraphics-at-point (point)))))
+
+(ert-deftest live-tex-preview-test-figure-resolution ()
+  (let ((directory (make-temp-file "live-tex-figure-resolution-" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "figures" directory))
+          (with-temp-file (expand-file-name "figures/plot.png" directory)
+            (insert "resolution-only"))
+          (live-tex-preview-test--buffer "\\includegraphics{figures/plot}"
+            (setq default-directory (file-name-as-directory directory)
+                  buffer-file-name (expand-file-name "main.tex" directory)
+                  live-tex-preview--main-file-cache 'unset)
+            (should
+             (equal (live-tex-preview--resolve-figure-file "figures/plot")
+                    (expand-file-name "figures/plot.png" directory)))
+            (should-not
+             (live-tex-preview--resolve-figure-file "figures/missing"))))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-figure-cache-invalidates-on-file-change ()
+  (let ((directory (make-temp-file "live-tex-figure-cache-" t)))
+    (unwind-protect
+        (let* ((pdf (expand-file-name "plot.pdf" directory))
+               (live-tex-preview-cache-directory ".cache")
+               (live-tex-preview-directory-function
+                (lambda () (file-name-as-directory directory))))
+          (with-temp-file pdf (insert "one"))
+          (let ((first (live-tex-preview-figure--pdf-cache-file pdf)))
+            (with-temp-file pdf (insert "a different size"))
+            (let ((second (live-tex-preview-figure--pdf-cache-file pdf)))
+              (should-not (equal first second)))))
+      (delete-directory directory t))))
+
+(ert-deftest live-tex-preview-test-figure-popup-scales-down-only ()
+  (let ((spec '(image :type png :file "/tmp/figure.png")))
+    (cl-letf (((symbol-function 'live-tex-preview-live--image-pixel-size)
+               (lambda (_image) '(2000 . 1000))))
+      (let ((scaled (live-tex-preview-live--scale-image-to-fit
+                     spec '(1000 . 500))))
+        (should (= (plist-get (cdr scaled) :width) 1000)))
+      (should
+       (equal (live-tex-preview-live--scale-image-to-fit
+               spec '(3000 . 2000))
+              spec)))))
+
+(ert-deftest live-tex-preview-test-missing-figure-is-diagnostic ()
+  (live-tex-preview-test--buffer "\\includegraphics{missing}"
+    (let ((live-tex-preview-figure-preview t)
+          shown)
+      (setq-local live-tex-preview-figure-function
+                  (lambda (_pos)
+                    (list :beg (point-min) :end (point-max)
+                          :argument "missing" :file nil)))
+      (cl-letf (((symbol-function 'live-tex-preview-live--show-text-popup)
+                 (lambda (_owner text) (setq shown text))))
+        (live-tex-preview-figure--refresh)
+        (should (string-match-p "Figure not found: missing" shown))
+        (live-tex-preview-figure--clear)))))
+
 (ert-deftest live-tex-preview-test-hash ()
   (let ((key (live-tex-preview-engine--hash "$x$" "p" "475pt" "/tmp/")))
     (should (= (length key) 64))
