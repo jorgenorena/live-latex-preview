@@ -19,8 +19,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y emacs-nox texlive-latex-base dvisvgm
 
-      - name: Tangle and show generated diff
+      - name: Check literate source and tests
+        run: sh ./literate check
+
+      - name: Byte compile core TeX frontend
         run: |
-          sh ./literate tangle
-          git diff -- live-tex-preview.el live-tex-preview-tex.el test/live-tex-preview-test.el
-          git diff --exit-code -- live-tex-preview.el live-tex-preview-tex.el test/live-tex-preview-test.el
+          emacs -Q --batch -L . -f batch-byte-compile \
+            live-tex-preview-engine.el live-tex-preview.el live-tex-preview-tex.el
+
+      - name: Smoke-test PDF to SVG conversion
+        run: |
+          mkdir -p /tmp/live-tex-pdf-smoke
+          cat >/tmp/live-tex-pdf-smoke/test.tex <<'EOF'
+          \\documentclass{article}
+          \\begin{document}
+          figure preview smoke test
+          \\end{document}
+          EOF
+          cd /tmp/live-tex-pdf-smoke
+          pdflatex -interaction=batchmode -halt-on-error test.tex
+          dvisvgm --pdf --page=1 --bbox=min --verbosity=0 \
+            --output=/tmp/live-tex-pdf-smoke/test.svg test.pdf
+          test -s /tmp/live-tex-pdf-smoke/test.svg
