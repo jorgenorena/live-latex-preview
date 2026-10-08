@@ -1,6 +1,7 @@
 # live-tex-preview
 
-Personal Emacs package for asynchronous math previews in TeX, Markdown and Quarto.
+Personal Emacs package for asynchronous math previews in TeX, Markdown and Quarto,
+plus direct figure previews for TeX `\\includegraphics` commands.
 GPL-3.0-or-later. This is an extracted and maintained personal implementation,
 not a MELPA release.
 
@@ -99,6 +100,27 @@ library. A TeX mode hook firing in a Quarto indirect buffer cannot enable a TeX
 frontend there. The GitHub recipe migration is separate from this frontend work;
 the dotfiles currently still use the local package checkout.
 
+## Figure previews
+
+With \`live-tex-preview-mode' enabled in a TeX buffer, placing point anywhere
+inside a direct \includegraphics command opens the referenced figure in the same
+child-frame popup used for block math.  Moving away closes it; the source text is
+never replaced.
+
+PNG, JPEG and SVG files are displayed directly.  PDF page 1 is converted
+asynchronously with \`dvisvgm' and cached as SVG.  Popup images are scaled down
+to fit the current frame while preserving aspect ratio and are never enlarged.
+Extensionless paths try the exact name first, then \`.pdf', \`.png', \`.jpg',
+\`.jpeg', and \`.svg'.  Relative paths are resolved from the main TeX document.
+
+A missing file produces a small "Figure not found" popup rather than an error.
+The PDF cache key includes the canonical source path, file size and modification
+time, so replacing a figure invalidates its preview automatically.
+
+This first implementation deliberately does not resolve \graphicspath,
+macro-expanded filenames, Markdown/Quarto image syntax, or figure references.
+Those can be layered on top of the same popup primitive later.
+
 ## Markdown and Quarto policy
 
 Recognized delimiters are `$...$`, `$$...$$`, `\(...\)` and `\[...\]`.
@@ -192,7 +214,8 @@ Interactive `live-tex-preview-buffer`, `-region`, `-at-point`, `-clear`,
 ## Cache and limitations
 
 The TeX frontend defaults to a `.cache` directory beside the main document.
-Only `live-tex-<sha256>.svg` and `.eld` files persist. Each job owns a separate
+Math caches use `live-tex-<sha256>.svg` and `.eld`; converted PDF figures use
+`live-tex-figure-<sha256>.svg`. Each render job owns a separate
 temporary directory under the cache and removes it on success, failure or
 cancellation. Metadata is read as data, never evaluated. The cache key includes
 fragment, preamble, page width, input directory, executable settings and format

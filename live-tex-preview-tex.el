@@ -30,7 +30,8 @@
               live-tex-preview-render-function #'live-tex-preview--place
               live-tex-preview-block-function #'live-tex-preview--block-fragment-p
               live-tex-preview-scan-function #'live-tex-preview--scan-region
-              live-tex-preview-directory-function #'live-tex-preview--main-dir)
+              live-tex-preview-directory-function #'live-tex-preview--main-dir
+              live-tex-preview-figure-function #'live-tex-preview--figure-at-point)
   (live-tex-preview--reset-caches))
 (defvar TeX-master)
 (declare-function TeX-master-file "tex")
@@ -40,6 +41,13 @@
     "gather" "gather*" "multline" "multline*" "flalign" "flalign*"
     "displaymath" "eqnarray" "eqnarray*" "math" "dmath" "dmath*")
   "Math environments whose \\begin..\\end blocks should be previewed."
+  :type '(repeat string)
+  :group 'live-tex-preview)
+
+(defcustom live-tex-preview-figure-extensions
+  '(".pdf" ".png" ".jpg" ".jpeg" ".svg")
+  "Extensions tried, in order, for extensionless includegraphics paths.
+An exact existing path is always preferred before these suffixes are tried."
   :type '(repeat string)
   :group 'live-tex-preview)
 
@@ -314,6 +322,83 @@ file-local variable; AUCTeX's `TeX-master-file'; finally this file itself."
      (or (and main (file-name-directory main))
          (and buffer-file-name (file-name-directory buffer-file-name))
          default-directory))))
+
+(defun live-tex-preview--parse-includegraphics-at (start)
+  "Parse an includegraphics command beginning at START.
+Return a plist with :beg, :end and :argument, or nil.  This handles direct
+filenames only; macro-expanded names and graphicspath are intentionally out of
+scope."
+  (save-excursion
+    (goto-char (+ start (length "\\includegraphics")))
+    (let ((limit (min (point-max) (+ start 4096))))
+      (when (eq (char-after) ?*)
+        (forward-char))
+      (skip-chars-forward " \t\r\n" limit)
+      (when (eq (char-after) ?[)
+        (forward-char)
+        (unless (search-forward "]" limit t)
+          (goto-char limit)))
+      (skip-chars-forward " \t\r\n" limit)
+      (when (eq (char-after) ?{)
+        (forward-char)
+        (let ((argument-beg (point)))
+          (when (search-forward "}" limit t)
+            (let ((argument
+                   (string-trim
+                    (buffer-substring-no-properties
+                     argument-beg (1- (point))))))
+              (unless (string-empty-p argument)
+                (list :beg start :end (point) :argument argument)))))))))
+
+(defun live-tex-preview--includegraphics-at-point (pos)
+  "Return the direct includegraphics command containing POS, or nil."
+  (save-excursion
+    (goto-char (min (point-max)
+                    (+ pos (length "\\includegraphics"))))
+    (let ((limit (max (point-min) (- pos 4096)))
+          found
+          done)
+      (while (and (not found) (not done)
+                  (search-backward "\\includegraphics" limit t))
+        (let ((start (point)))
+          (unless (or (live-tex-preview--in-comment-p start)
+                      (live-tex-preview--escaped-p start))
+            (when-let ((entry
+                        (live-tex-preview--parse-includegraphics-at start)))
+              (cond
+               ((and (<= (plist-get entry :beg) pos)
+                     (< pos (plist-get entry :end)))
+                (setq found entry))
+               ((< (plist-get entry :end) pos)
+                (setq done t)))))))
+      found)))
+
+(defun live-tex-preview--resolve-figure-file (argument)
+  "Resolve direct includegraphics ARGUMENT relative to the main TeX document.
+Try the exact path first.  For extensionless paths, then try
+\`live-tex-preview-figure-extensions' in order.  Return an absolute file name
+or nil."
+  (let* ((base (if (file-name-absolute-p argument)
+                   (expand-file-name argument)
+                 (expand-file-name argument (live-tex-preview--main-dir))))
+         (candidates
+          (if (file-name-extension base)
+              (list base)
+            (cons base
+                  (mapcar (lambda (extension)
+                            (concat base extension))
+                          live-tex-preview-figure-extensions)))))
+    (cl-find-if (lambda (file)
+                  (and (file-regular-p file)
+                       (file-readable-p file)))
+                candidates)))
+
+(defun live-tex-preview--figure-at-point (pos)
+  "Return figure metadata for the includegraphics command containing POS."
+  (when-let ((entry (live-tex-preview--includegraphics-at-point pos)))
+    (plist-put (copy-sequence entry) :file
+               (live-tex-preview--resolve-figure-file
+                (plist-get entry :argument)))))
 
 (defun live-tex-preview--preamble-in-buffer ()
   "Return the preamble (before \\begin{document}) of the current buffer."
