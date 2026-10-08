@@ -963,7 +963,7 @@ When OV is non-nil, hide only if OV owns the current popup."
             ov (format "PDF preview failed: %s" (file-name-nondirectory file)))
            (live-tex-preview-figure--show-state ov)
            (message "live-tex-preview: could not start PDF preview: %s"
-                    (error-message-string err))))))))
+                    (error-message-string err)))))))
 
 (defun live-tex-preview-figure--prepare-entry (ov entry signature)
   "Load or start rendering figure ENTRY for OV and record SIGNATURE."
