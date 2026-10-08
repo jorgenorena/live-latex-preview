@@ -280,6 +280,14 @@ there is not enough room above.  `below' uses the ordinary below-point handler."
                  (const :tag "Below point, fallback above" below))
   :group 'live-tex-preview)
 
+
+(defcustom live-tex-preview-figure-preview t
+  "When non-nil, show a popup while point is on a TeX includegraphics command.
+Raster/SVG files are displayed directly.  PDF page 1 is converted
+asynchronously to cached SVG using \`live-tex-preview-dvisvgm-command'."
+  :type 'boolean
+  :group 'live-tex-preview)
+
 (defcustom live-tex-preview-live-clear-before-commands
   '(next-line previous-line
 	      evil-next-line evil-previous-line evil-line-move
@@ -399,6 +407,8 @@ message and return nil."
   "Function of BEG END returning frontend entries.")
 (defvar-local live-tex-preview-directory-function nil
   "Function returning the frontend's document directory.")
+(defvar-local live-tex-preview-figure-function nil
+  "Function of POS returning a figure plist with :beg, :end, :argument and :file.")
 (defvar live-tex-preview--fragment-limit nil
   "Upper bound for local fragment lookup during overlay regeneration.")
 
@@ -428,6 +438,7 @@ message and return nil."
 
 (defun live-tex-preview--prepare-frontend ()
   "Select the current buffer's frontend and refresh document settings."
+  (setq-local live-tex-preview-figure-function nil)
   (cond
    ((derived-mode-p 'markdown-mode)
     (require 'live-tex-preview-markdown)
@@ -753,6 +764,248 @@ When OV is non-nil, hide only if OV owns the current popup."
            :background-color (face-background 'default nil t)
            :foreground-color (face-foreground 'default nil t)))))))
 
+
+(defun live-tex-preview-live--show-text-popup (owner text)
+  "Show TEXT in the child-frame popup, owned by OWNER."
+  (let ((live-tex-preview-live-block-display 'posframe))
+    (if (not (live-tex-preview-live--popup-workable-p))
+        (message "live-tex-preview: %s" text)
+      (when-let ((window (live-tex-preview-live--source-window)))
+        (let* ((lines (split-string text "\n"))
+               (frame (window-frame window))
+               (max-width (max 2 (- (frame-width frame) 2)))
+               (max-height (max 2 (- (frame-height frame) 2)))
+               (width (min max-width
+                           (max 2 (+ 2 (apply #'max (mapcar #'string-width lines))))))
+               (height (min max-height (max 1 (length lines)))))
+          (setq live-tex-preview-live--popup-overlay owner)
+          (with-selected-window window
+            (posframe-show
+             live-tex-preview-live-popup-buffer
+             :string text
+             :position (point)
+             :poshandler (live-tex-preview-live--popup-poshandler)
+             :width width :height height
+             :min-width width :min-height height
+             :max-width max-width :max-height max-height
+             :lines-truncate t
+             :accept-focus nil
+             :hidehandler #'posframe-hidehandler-when-buffer-switch
+             :border-width live-tex-preview-live-popup-border-width
+             :border-color (live-tex-preview-live--face-color
+                            'shadow :foreground
+                            (live-tex-preview-live--face-color
+                             'mode-line-inactive :background
+                             (face-foreground 'default nil t)))
+             :internal-border-width live-tex-preview-live-popup-internal-border-width
+             :background-color (face-background 'default nil t)
+             :foreground-color (face-foreground 'default nil t))))))))
+
+(defvar-local live-tex-preview-figure--overlay nil
+  "Transient source overlay owning the current figure popup.")
+(defvar-local live-tex-preview-figure--process nil
+  "Current asynchronous PDF conversion process, or nil.")
+(defvar-local live-tex-preview-figure--generation 0
+  "Generation counter rejecting stale asynchronous figure results.")
+
+(defun live-tex-preview-figure--cache-directory ()
+  "Return the cache directory used for converted figure previews."
+  (let ((directory
+         (if live-tex-preview-cache-directory
+             (expand-file-name
+              live-tex-preview-cache-directory
+              (if live-tex-preview-directory-function
+                  (funcall live-tex-preview-directory-function)
+                default-directory))
+           live-tex-preview-engine-cache-directory)))
+    (make-directory directory t)
+    (file-name-as-directory directory)))
+
+(defun live-tex-preview-figure--file-signature (file)
+  "Return a cache signature for existing FILE, or nil."
+  (when-let ((attributes (file-attributes file 'string)))
+    (list (file-truename file)
+          (file-attribute-size attributes)
+          (file-attribute-modification-time attributes))))
+
+(defun live-tex-preview-figure--pdf-cache-file (file)
+  "Return the cached SVG path corresponding to PDF FILE."
+  (when-let ((signature (live-tex-preview-figure--file-signature file)))
+    (expand-file-name
+     (format "live-tex-figure-%s.svg"
+             (secure-hash 'sha256 (prin1-to-string signature)))
+     (live-tex-preview-figure--cache-directory))))
+
+(defun live-tex-preview-figure--ensure-overlay (beg end)
+  "Return the transient figure overlay spanning BEG through END."
+  (let ((ov live-tex-preview-figure--overlay))
+    (unless (and ov (overlay-buffer ov))
+      (setq ov (make-overlay beg end nil nil t)
+            live-tex-preview-figure--overlay ov)
+      (overlay-put ov 'live-tex-preview-type 'live-tex-preview-figure-overlay)
+      (overlay-put ov 'evaporate t))
+    (move-overlay ov beg end)
+    ov))
+
+(defun live-tex-preview-figure--cancel-process ()
+  "Cancel any in-flight PDF figure conversion."
+  (when (and live-tex-preview-figure--process
+             (process-live-p live-tex-preview-figure--process))
+    (delete-process live-tex-preview-figure--process))
+  (setq live-tex-preview-figure--process nil))
+
+(defun live-tex-preview-figure--clear ()
+  "Remove transient figure preview state owned by this buffer."
+  (cl-incf live-tex-preview-figure--generation)
+  (live-tex-preview-figure--cancel-process)
+  (when (and live-tex-preview-figure--overlay
+             (overlay-buffer live-tex-preview-figure--overlay))
+    (live-tex-preview-live--hide-popup live-tex-preview-figure--overlay)
+    (delete-overlay live-tex-preview-figure--overlay))
+  (setq live-tex-preview-figure--overlay nil))
+
+(defun live-tex-preview-figure--set-message (ov text)
+  "Store TEXT as the popup state for figure overlay OV."
+  (overlay-put ov 'live-tex-preview-figure-image nil)
+  (overlay-put ov 'live-tex-preview-figure-message text))
+
+(defun live-tex-preview-figure--show-state (ov)
+  "Display the current cached image or diagnostic for figure overlay OV."
+  (cond
+   ((overlay-get ov 'live-tex-preview-figure-image)
+    (let ((live-tex-preview-live-block-display 'posframe))
+      (live-tex-preview-live--show-popup
+       ov (overlay-get ov 'live-tex-preview-figure-image))))
+   ((overlay-get ov 'live-tex-preview-figure-message)
+    (live-tex-preview-live--show-text-popup
+     ov (overlay-get ov 'live-tex-preview-figure-message)))))
+
+(defun live-tex-preview-figure--display-image-file (ov file)
+  "Display image FILE in the popup owned by OV."
+  (condition-case err
+      (progn
+        (when (fboundp 'clear-image-cache)
+          (clear-image-cache file))
+        (if-let ((image (create-image file nil nil)))
+            (progn
+              (overlay-put ov 'live-tex-preview-figure-message nil)
+              (overlay-put ov 'live-tex-preview-figure-image image)
+              (live-tex-preview-figure--show-state ov))
+          (live-tex-preview-figure--set-message
+           ov (format "Cannot display figure: %s" (file-name-nondirectory file)))
+          (live-tex-preview-figure--show-state ov)))
+    (error
+     (live-tex-preview-figure--set-message
+      ov (format "Cannot display figure: %s" (file-name-nondirectory file)))
+     (live-tex-preview-figure--show-state ov)
+     (message "live-tex-preview: cannot display %s: %s"
+              file (error-message-string err)))))
+
+(defun live-tex-preview-figure--start-pdf-conversion (ov file output)
+  "Convert page 1 of PDF FILE asynchronously to SVG OUTPUT for OV."
+  (let ((program (executable-find live-tex-preview-dvisvgm-command)))
+    (if (not program)
+        (progn
+          (live-tex-preview-figure--set-message ov "PDF preview needs dvisvgm")
+          (live-tex-preview-figure--show-state ov))
+      (live-tex-preview-figure--set-message ov "Rendering PDF preview...")
+      (live-tex-preview-figure--show-state ov)
+      (let* ((source-buffer (current-buffer))
+             (generation (cl-incf live-tex-preview-figure--generation))
+             (log-buffer (generate-new-buffer " *live-tex-preview-figure-log*"))
+             process)
+        (condition-case err
+            (progn
+              (setq process
+                    (make-process
+                     :name (format "live-tex-preview-pdf-%d" generation)
+                     :buffer log-buffer
+                     :command
+                     (list program "--pdf" "--page=1" "--bbox=min" "--verbosity=0"
+                           (concat "--output=" output) file)
+                     :noquery t
+                     :sentinel
+                     (lambda (proc _event)
+                       (when (memq (process-status proc) '(exit signal))
+                         (let* ((ok (and (= (process-exit-status proc) 0)
+                                         (file-regular-p output)))
+                                (details
+                                 (when (buffer-live-p log-buffer)
+                                   (with-current-buffer log-buffer
+                                     (string-trim (buffer-string))))))
+                           (unless ok
+                             (when (file-exists-p output)
+                               (ignore-errors (delete-file output))))
+                           (when (buffer-live-p source-buffer)
+                             (with-current-buffer source-buffer
+                               (when (eq proc live-tex-preview-figure--process)
+                                 (setq live-tex-preview-figure--process nil))
+                               (when (and (= generation live-tex-preview-figure--generation)
+                                          (overlay-buffer ov))
+                                 (if ok
+                                     (live-tex-preview-figure--display-image-file ov output)
+                                   (live-tex-preview-figure--set-message
+                                    ov (format "PDF preview failed: %s"
+                                               (file-name-nondirectory file)))
+                                   (live-tex-preview-figure--show-state ov)
+                                   (when (and details (not (string-empty-p details)))
+                                     (message
+                                      "live-tex-preview: PDF preview failed for %s: %s"
+                                      file
+                                      (truncate-string-to-width details 300)))))))
+                           (when (buffer-live-p log-buffer)
+                             (kill-buffer log-buffer))))))))
+              (setq live-tex-preview-figure--process process))
+          (error
+           (when (buffer-live-p log-buffer)
+             (kill-buffer log-buffer))
+           (live-tex-preview-figure--set-message
+            ov (format "PDF preview failed: %s" (file-name-nondirectory file)))
+           (live-tex-preview-figure--show-state ov)
+           (message "live-tex-preview: could not start PDF preview: %s"
+                    (error-message-string err))))))))
+
+(defun live-tex-preview-figure--prepare-entry (ov entry signature)
+  "Load or start rendering figure ENTRY for OV and record SIGNATURE."
+  (live-tex-preview-figure--cancel-process)
+  (overlay-put ov 'live-tex-preview-figure-signature signature)
+  (overlay-put ov 'live-tex-preview-figure-image nil)
+  (overlay-put ov 'live-tex-preview-figure-message nil)
+  (let ((file (plist-get entry :file))
+        (argument (plist-get entry :argument)))
+    (cond
+     ((not file)
+      (live-tex-preview-figure--set-message
+       ov (format "Figure not found: %s" argument))
+      (live-tex-preview-figure--show-state ov))
+     ((string-equal (downcase (or (file-name-extension file) "")) "pdf")
+      (let ((cached (live-tex-preview-figure--pdf-cache-file file)))
+        (if (and cached (file-regular-p cached))
+            (live-tex-preview-figure--display-image-file ov cached)
+          (live-tex-preview-figure--start-pdf-conversion ov file cached))))
+     (t
+      (live-tex-preview-figure--display-image-file ov file)))))
+
+(defun live-tex-preview-figure--refresh ()
+  "Refresh the figure popup for the includegraphics command at point."
+  (if (and live-tex-preview-figure-preview
+           live-tex-preview-figure-function)
+      (if-let ((entry (funcall live-tex-preview-figure-function (point))))
+          (let* ((beg (plist-get entry :beg))
+                 (end (plist-get entry :end))
+                 (file (plist-get entry :file))
+                 (signature
+                  (list beg end (plist-get entry :argument) file
+                        (and file
+                             (live-tex-preview-figure--file-signature file))))
+                 (ov (live-tex-preview-figure--ensure-overlay beg end)))
+            (if (equal signature
+                       (overlay-get ov 'live-tex-preview-figure-signature))
+                (live-tex-preview-figure--show-state ov)
+              (live-tex-preview-figure--prepare-entry ov entry signature)))
+        (live-tex-preview-figure--clear))
+    (live-tex-preview-figure--clear)))
+
 (defun live-tex-preview-live--context-enabled-p (context contexts)
   "Return non-nil when CONTEXT is enabled by CONTEXTS.
 CONTEXT is either `block' or `inline'.  CONTEXTS may be t, nil, or a list."
@@ -995,6 +1248,9 @@ edited).  While the cursor sits in a fragment, a live-updating preview is
 shown in a popup (display math) or beside (inline math) the source as you type
 — see `live-tex-preview-display-live'.
 
+In TeX buffers it also shows a floating preview when point is on a direct
+`\includegraphics' command, when `live-tex-preview-figure-preview' is non-nil.
+
 This minor mode only handles auto open/close and live updating.  Generate
 the previews themselves with `live-tex-preview-buffer' or
 `live-tex-preview-region'."
@@ -1020,6 +1276,10 @@ the previews themselves with `live-tex-preview-buffer' or
                   #'live-tex-preview-mode--handle-post-cursor nil 'local)
         (add-hook 'post-command-hook
                   #'live-tex-preview--refresh-visible-overlays 90 'local)
+        (add-hook 'post-command-hook
+                  #'live-tex-preview-figure--refresh 96 'local)
+        (add-hook 'kill-buffer-hook
+                  #'live-tex-preview-figure--clear nil 'local)
         (when live-tex-preview-display-live
           (live-tex-preview-live--setup)))
     (remove-hook 'pre-command-hook
@@ -1028,6 +1288,11 @@ the previews themselves with `live-tex-preview-buffer' or
                  #'live-tex-preview-mode--handle-post-cursor 'local)
     (remove-hook 'post-command-hook
                  #'live-tex-preview--refresh-visible-overlays 'local)
+    (remove-hook 'post-command-hook
+                 #'live-tex-preview-figure--refresh 'local)
+    (remove-hook 'kill-buffer-hook
+                 #'live-tex-preview-figure--clear 'local)
+    (live-tex-preview-figure--clear)
     (live-tex-preview-live--teardown)
     (live-tex-preview--cleanup)
     (dolist (ov (overlays-in (point-min) (point-max)))
