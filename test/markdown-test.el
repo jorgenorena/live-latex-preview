@@ -76,6 +76,51 @@
   (should (equal (live-tex-preview-test--math live-tex-preview-test--qmd)
                  '("$E=mc^2$" "$$\nH^2 = \\frac{8\\pi G}{3}\\rho\n$$" "$\\Omega_m$"))))
 
+(ert-deftest live-tex-preview-md-auto-discovery-excludes-code ()
+  (live-tex-preview-test--markdown
+      "Before $x$.\n\n`$inline_code$`\n\n```python\n$code$\n```\n\n$$y$$\n"
+    (let ((live-tex-preview-display-live nil) submissions)
+      (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+        (live-tex-preview-auto-mode 1)
+        (setq-local live-tex-preview-render-function
+                    (lambda (entries) (push (mapcar #'caddr entries) submissions)))
+        (goto-char 9)
+        (live-tex-preview-auto--check (current-buffer))
+        (should (equal submissions '(("$$y$$"))))
+        (goto-char (point-max))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (equal (car submissions) '("$x$")))
+        (live-tex-preview-mode -1)))))
+
+(ert-deftest live-tex-preview-md-auto-respects-indirect-editing-point ()
+  (let ((host (generate-new-buffer " *live-tex-auto-host*")) inner)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer host
+            (markdown-mode)
+            (insert "Before $new$ after.\n")
+            (setq inner (make-indirect-buffer host " *live-tex-auto-inner*" t)))
+          (set-window-buffer (selected-window) inner)
+          (with-current-buffer inner
+            (latex-mode)
+            (goto-char 10)
+            (set-window-point (selected-window) 10))
+          (with-current-buffer host
+            (let ((live-tex-preview-display-live nil) submissions)
+              (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+                (live-tex-preview-auto-mode 1)
+                (setq-local live-tex-preview-render-function
+                            (lambda (entries) (push (mapcar #'caddr entries) submissions)))
+                (goto-char (point-max)) ;host point is stale while editing inner
+                (live-tex-preview-auto--check host)
+                (should-not submissions)
+                (set-window-point (selected-window) 15)
+                (live-tex-preview-auto--check host)
+                (should (equal submissions '(("$new$"))))
+                (live-tex-preview-mode -1)))))
+      (when (buffer-live-p inner) (kill-buffer inner))
+      (kill-buffer host))))
+
 (ert-deftest live-tex-preview-md-current-fragment-and-regions ()
   (live-tex-preview-test--markdown "A $x$ and $$y$$ then $z$."
 				   (goto-char 4)
@@ -125,7 +170,8 @@
 					     (should (overlay-get ov 'after-string))
 					     (goto-char (1- (overlay-end ov))) (insert "+1")
 					     (live-tex-preview-live--regenerate)
-					     (live-tex-preview-test--await (car live-tex-preview--jobs))
+					     (while live-tex-preview--jobs
+					       (live-tex-preview-test--await (car live-tex-preview--jobs)))
 					     (live-tex-preview-mode--handle-pre-cursor)
 					     (goto-char (overlay-end ov))
 					     (live-tex-preview-mode--handle-post-cursor)
@@ -200,7 +246,8 @@
                 (should (overlay-get live-tex-preview-polymode--presentation 'after-string))
                 (insert "z")
                 (live-tex-preview-polymode--regenerate)
-                (live-tex-preview-test--await (car (buffer-local-value 'live-tex-preview--jobs host)))
+                (while (buffer-local-value 'live-tex-preview--jobs host)
+                  (live-tex-preview-test--await (car (buffer-local-value 'live-tex-preview--jobs host))))
                 (should-not (equal old-key (plist-get (overlay-get source 'live-tex-preview-metadata) :key)))
                 (live-tex-preview-polymode--before-switch inner host)
                 (should-not live-tex-preview-polymode--presentation))

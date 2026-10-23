@@ -56,9 +56,12 @@ disturb vertical motion and line layout.
 The public commands are =live-tex-preview-buffer=,
 =live-tex-preview-region=, =live-tex-preview-at-point=,
 =live-tex-preview-clear=, and =live-tex-preview-clear-cache=.
-=live-tex-preview-mode= manages reveal/restore and live updates.  Explicit
-preview commands create the first overlays; ordinary typing does not scan the
-whole document for new expressions.
+=live-tex-preview-mode= manages reveal/restore and live updates.
+=live-tex-preview-buffer= also enables =live-tex-preview-auto-mode=: after an
+idle delay it discovers new expressions, waiting until point leaves each one
+before rendering it.  Existing previews still update while typing.  Discovery
+scans only after text changes and retains deferred candidates across cursor
+movement.  Clearing previews stops discovery.
 
 An overlay carries a monotonically increasing generation.  A render callback
 may install an image only when the overlay still exists, its generation is
@@ -505,6 +508,9 @@ Placement creates or reuses source overlays and records a generation/source snap
 (defvar live-tex-preview-fragment-function)
 (defvar live-tex-preview-fit-to-window)
 (defvar live-tex-preview-fit-window-margin)
+(defvar live-tex-preview--auto-rendering nil
+  "Non-nil while submitting first previews through automatic discovery.")
+(defvar-local live-tex-preview-auto--tick nil)
 (defcustom live-tex-preview-zoom 1.0
   "Font-relative display zoom; independent of compiled cache contents."
   :type 'number :group 'live-tex-preview-engine)
@@ -531,18 +537,26 @@ Placement creates or reuses source overlays and records a generation/source snap
           (overlay-put ov hook '(live-tex-preview--mark-modified)))
         ov)))
 
-(defun live-tex-preview--image-max-width ()
-  "Return a safe image width in pixels for the current buffer's window.
-The text area's width excludes margins installed by packages such as
-visual-fill-column.  Leave a small character-cell margin so an image at the
-wrapping boundary cannot make redisplay alternate between two layouts."
+(defun live-tex-preview--image-max-width (&optional position)
+  "Return a safe image width in pixels at POSITION, defaulting to point.
+Subtract the source line's indentation, measured in pixels to respect tabs,
+faces and text scaling.  Use the smallest available width across windows
+showing this buffer, excluding their margins and a wrap-safety reserve."
   (when live-tex-preview-fit-to-window
-    (when-let ((window (if (eq (window-buffer (selected-window)) (current-buffer))
-                           (selected-window)
-                         (get-buffer-window (current-buffer) t))))
-      (max 1 (- (window-body-width window t)
-                (* live-tex-preview-fit-window-margin
-                   (frame-char-width (window-frame window))))))))
+    (save-excursion
+      (goto-char (or position (point)))
+      (let ((start (line-beginning-position))
+            (end (min (point) (save-excursion (back-to-indentation) (point)))))
+        (when-let ((widths
+                    (mapcar
+                     (lambda (window)
+                       (max 1 (- (window-body-width window t)
+                                 (if (= start end) 0
+                                   (car (window-text-pixel-size window start end)))
+                                 (* live-tex-preview-fit-window-margin
+                                    (frame-char-width (window-frame window))))))
+                     (get-buffer-window-list (current-buffer) nil t))))
+          (apply #'min widths))))))
 
 (cl-defun live-tex-preview-place (entries &key preamble page-width cache-directory input-directory)
   "Render (BEG END LATEX) ENTRIES and place previews in the current buffer.
@@ -557,6 +571,8 @@ buffer-local fragment, render and block callback variables below."
                        (let* ((ov (live-tex-preview--ensure-overlay beg end))
                               (generation (1+ (or (overlay-get ov 'live-tex-preview-generation) 0))))
                          (overlay-put ov 'live-tex-preview-generation generation)
+                         (when live-tex-preview--auto-rendering
+                           (overlay-put ov 'live-tex-preview-defer-first t))
                          (list ov generation (buffer-substring-no-properties beg end)))))
                    entries))
          job)
@@ -580,17 +596,29 @@ buffer-local fragment, render and block callback variables below."
                                                (run-hook-with-args 'live-tex-preview-overlay-close-functions ov)
                                                (delete-overlay ov) nil)))
                             do
-                            (if (null info)
+                            (cond
+                             ((and (overlay-get ov 'live-tex-preview-defer-first)
+                                   (live-tex-preview-auto--point-in-p
+                                    (overlay-start ov) (overlay-end ov)))
+                              ;; Point returned while rendering.  Rediscover
+                              ;; after exit; the result is already cached.
+                              (live-tex-preview-live--clearout ov)
+                              (run-hook-with-args 'live-tex-preview-overlay-close-functions ov)
+                              (delete-overlay ov)
+                              (setq live-tex-preview-auto--tick nil))
+                             ((null info)
 				(progn
                                   (overlay-put ov 'help-echo error-text)
-                                  (overlay-put ov 'live-tex-preview-state 'modified))
+                                  (overlay-put ov 'live-tex-preview-state 'modified)))
+                             (t
                               (let ((image (live-tex-preview-image
                                             info live-tex-preview-zoom
-                                            (live-tex-preview--image-max-width)))
+                                            (live-tex-preview--image-max-width (overlay-start ov))))
                                     (face (or (and (> (overlay-start ov) (point-min))
                                                    (get-text-property (1- (overlay-start ov)) 'face))
                                               'default)))
 				(overlay-put ov 'help-echo nil)
+				(overlay-put ov 'live-tex-preview-defer-first nil)
 				(overlay-put ov 'live-tex-preview-metadata info)
 				(overlay-put ov 'live-tex-preview-image image)
 				(overlay-put ov 'live-tex-preview-hidden-face face)
@@ -599,7 +627,7 @@ buffer-local fragment, render and block callback variables below."
                                   (overlay-put ov 'display image)
                                   (overlay-put ov 'face face))
 				(live-tex-preview--sync-overlay-display ov)
-				(run-hook-with-args 'live-tex-preview-overlay-update-functions ov))))
+				(run-hook-with-args 'live-tex-preview-overlay-update-functions ov)))))
                    (when error-text (message "live-tex-preview: %s" error-text))))))
            :preamble preamble :page-width page-width :cache-directory cache-directory
            :input-directory input-directory))
@@ -617,6 +645,8 @@ buffer-local fragment, render and block callback variables below."
 
 (defun live-tex-preview--cleanup ()
   "Cancel pending work and hide live UI owned by this buffer."
+  (when (bound-and-true-p live-tex-preview-auto-mode)
+    (live-tex-preview-auto-mode -1))
   (dolist (timer live-tex-preview--timers) (cancel-timer timer))
   (setq live-tex-preview--timers nil)
   (dolist (job (copy-sequence live-tex-preview--jobs)) (live-tex-preview-cancel job))
@@ -855,21 +885,29 @@ message and return nil."
         visible)))
 
 (defun live-tex-preview--sync-overlay-display (ov)
-  "Show or hide preview image OV according to visible-window proximity."
-  (when (and live-tex-preview-lazy-display
-             (overlay-buffer ov)
+  "Fit OV to its indented position and show it near visible windows."
+  (when (and (overlay-buffer ov)
              (eq (overlay-get ov 'live-tex-preview-type) 'live-tex-preview-overlay)
              (not (overlay-get ov 'live-tex-preview-view-text)))
     (if (live-tex-preview--overlay-near-visible-window-p ov)
-        (when-let ((image (overlay-get ov 'live-tex-preview-image)))
-          (overlay-put ov 'display image)
+        (when-let ((old-image (overlay-get ov 'live-tex-preview-image)))
+          (let* ((metadata (overlay-get ov 'live-tex-preview-metadata))
+                 (image (if metadata
+                            (live-tex-preview-image
+                             metadata live-tex-preview-zoom
+                             (live-tex-preview--image-max-width (overlay-start ov)))
+                          old-image)))
+            (unless (equal image old-image)
+              (overlay-put ov 'live-tex-preview-image image))
+            (unless (equal image (overlay-get ov 'display))
+              (overlay-put ov 'display image)))
           (overlay-put ov 'face (overlay-get ov 'live-tex-preview-hidden-face)))
       (overlay-put ov 'display nil)
       (overlay-put ov 'face nil))))
 
-(defun live-tex-preview--refresh-visible-overlays ()
+(defun live-tex-preview--refresh-visible-overlays (&optional _window)
   "Refresh active image display for previews in the current buffer."
-  (when live-tex-preview-lazy-display
+  (when (or live-tex-preview-lazy-display live-tex-preview-fit-to-window)
     (dolist (ov (overlays-in (point-min) (point-max)))
       (live-tex-preview--sync-overlay-display ov))))
 
@@ -965,10 +1003,12 @@ Commands resolve indirect buffers to their document owner, then ask buffer-local
   "Regenerate OV through its frontend, or discard invalid boundaries."
   (when (overlay-buffer ov)
     (with-current-buffer (overlay-buffer ov)
-      (if-let ((entry (live-tex-preview-mode--fragment-for-overlay ov)))
-          (funcall live-tex-preview-render-function (list entry))
-        (live-tex-preview-live--clearout ov)
-        (delete-overlay ov)))))
+      (unless (and (overlay-get ov 'live-tex-preview-defer-first)
+                   (live-tex-preview-auto--point-in-p (overlay-start ov) (overlay-end ov)))
+        (if-let ((entry (live-tex-preview-mode--fragment-for-overlay ov)))
+            (funcall live-tex-preview-render-function (list entry))
+          (live-tex-preview-live--clearout ov)
+          (delete-overlay ov))))))
 
 (defun live-tex-preview-mode--open-this-overlay ()
   "Reveal the raw LaTeX of the preview overlay at point."
@@ -1423,6 +1463,106 @@ Run (debounced and throttled) from `after-change-functions'."
 
 #+end_src
 
+** Automatic discovery
+
+Buffer-wide preview opts into discovery.  A repeating idle timer checks the
+buffer's text modification tick; the frontend scans once per changed text
+version, then deferred candidates can be reconsidered without another scan.
+Existing and pending overlays are excluded.  First previews wait for point to
+leave, including when point returns before an asynchronous result arrives.
+Existing overlays keep their usual live regeneration path.
+
+#+begin_src emacs-lisp :tangle live-tex-preview.el
+(defcustom live-tex-preview-auto-delay 0.5
+  "Idle seconds before discovering and previewing new math fragments."
+  :type 'number :group 'live-tex-preview)
+
+(defvar-local live-tex-preview-auto--timer nil)
+(defvar-local live-tex-preview-auto--candidates nil)
+(defvar-local live-tex-preview-auto--owner nil)
+(defvar live-tex-preview-auto-mode)
+(defvar live-tex-preview-mode)
+
+(defun live-tex-preview-auto--teardown ()
+  "Clean up discovery in its owner, allowing indirect buffers to initialize."
+  (when (eq live-tex-preview-auto--owner (current-buffer))
+    (live-tex-preview--cleanup)))
+
+(defun live-tex-preview-auto--point-in-p (beg end)
+  "Return non-nil when editing point lies between BEG and END.
+Use the selected indirect buffer's point when it belongs to this document."
+  (let* ((document (current-buffer))
+         (editing-buffer (window-buffer (selected-window)))
+         (position (if (with-current-buffer editing-buffer
+                         (eq document (live-tex-preview--document-buffer)))
+                       (window-point (selected-window))
+                     (point))))
+    (and (<= beg position) (< position end))))
+
+(defun live-tex-preview-auto--previewed-p (entry)
+  "Return non-nil if ENTRY already has an overlay, including pending jobs."
+  (cl-some (lambda (ov)
+             (and (eq (overlay-get ov 'live-tex-preview-type) 'live-tex-preview-overlay)
+                  (= (overlay-start ov) (car entry))
+                  (= (overlay-end ov) (cadr entry))))
+           (overlays-in (car entry) (cadr entry))))
+
+(defun live-tex-preview-auto--check (buffer)
+  "Discover missing previews in BUFFER after an idle period."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and live-tex-preview-auto-mode live-tex-preview-mode
+                 (live-tex-preview--graphical-frame-p))
+        (save-excursion
+          (save-restriction
+            (save-match-data
+              (widen)
+              (condition-case err
+                  (progn
+                    (unless (eql live-tex-preview-auto--tick (buffer-chars-modified-tick))
+                      (setq live-tex-preview-auto--tick (buffer-chars-modified-tick)
+                            live-tex-preview-auto--candidates
+                            (cl-remove-if
+                             #'live-tex-preview-auto--previewed-p
+                             (funcall live-tex-preview-scan-function (point-min) (point-max)))))
+                    (let (ready deferred)
+                      (dolist (entry live-tex-preview-auto--candidates)
+                        (unless (live-tex-preview-auto--previewed-p entry)
+                          (if (live-tex-preview-auto--point-in-p (car entry) (cadr entry))
+                              (push entry deferred)
+                            (push entry ready))))
+                      (setq live-tex-preview-auto--candidates (nreverse deferred))
+                      (when ready
+                        (let ((live-tex-preview--auto-rendering t))
+                          (funcall live-tex-preview-render-function (nreverse ready))))))
+                (error (message "live-tex-preview discovery: %s" (error-message-string err)))))))))))
+
+;;;###autoload
+(define-minor-mode live-tex-preview-auto-mode
+  "Preview new equations on idle after point leaves them.
+Enabled by `live-tex-preview-buffer'.  Existing previews continue updating
+while editing.  Disable this mode to stop discovery while keeping previews;
+`live-tex-preview-clear' stops discovery and removes the previews too."
+  :lighter " AutoLtx"
+  (when (and (eq live-tex-preview-auto--owner (current-buffer))
+             (timerp live-tex-preview-auto--timer))
+    (cancel-timer live-tex-preview-auto--timer))
+  (setq live-tex-preview-auto--timer nil
+        live-tex-preview-auto--owner nil
+        live-tex-preview-auto--tick nil
+        live-tex-preview-auto--candidates nil)
+  (when live-tex-preview-auto-mode
+    (unless live-tex-preview-mode (live-tex-preview-mode 1))
+    (if (not live-tex-preview-mode)
+        (setq live-tex-preview-auto-mode nil)
+      (setq live-tex-preview-auto--owner (current-buffer)
+            live-tex-preview-auto--timer
+            (run-with-idle-timer (max 0.01 live-tex-preview-auto-delay) t
+                                 #'live-tex-preview-auto--check (current-buffer)))
+      (add-hook 'kill-buffer-hook #'live-tex-preview-auto--teardown nil t)
+      (add-hook 'change-major-mode-hook #'live-tex-preview-auto--teardown nil t))))
+#+end_src
+
 ** Commands and minor-mode lifecycle
 
 Interactive commands validate the frame and frontend, then scan only the requested extent.  Cache clearing removes only package-owned =live-tex-*= artifacts.  Enabling the mode selects the frontend and installs cursor/live hooks; disabling it unwinds those effects and cancels owned work.
@@ -1492,10 +1632,12 @@ Set to nil to leave the document class's text width unchanged."
 
 ;;;###autoload
 (defun live-tex-preview-buffer ()
-  "Preview every LaTeX math fragment in the buffer."
+  "Preview every math fragment and enable automatic previews of new ones.
+New fragments wait until point leaves them; existing previews update live."
   (interactive)
   (live-tex-preview--with-document
-   (live-tex-preview-region (point-min) (point-max))))
+   (live-tex-preview-region (point-min) (point-max))
+   (live-tex-preview-auto-mode 1)))
 
 ;;;###autoload
 (defun live-tex-preview-at-point ()
@@ -1513,9 +1655,10 @@ Set to nil to leave the document class's text width unchanged."
 
 ;;;###autoload
 (defun live-tex-preview-clear ()
-  "Remove all LaTeX preview overlays in the buffer."
+  "Stop automatic discovery and remove all LaTeX previews in the buffer."
   (interactive)
   (live-tex-preview--with-document
+   (live-tex-preview-auto-mode -1)
    (live-tex-preview-clear-overlays (point-min) (point-max))
    (message "live-tex-preview: cleared")))
 
@@ -1529,9 +1672,8 @@ edited).  While the cursor sits in a fragment, a live-updating preview is
 shown in a popup (display math) or beside (inline math) the source as you type
 — see `live-tex-preview-display-live'.
 
-This minor mode only handles auto open/close and live updating.  Generate
-the previews themselves with `live-tex-preview-buffer' or
-`live-tex-preview-region'."
+Generate initial previews with `live-tex-preview-buffer' (which also enables
+`live-tex-preview-auto-mode') or `live-tex-preview-region'."
   :lighter " LtxPrev"
   (if live-tex-preview-mode
       (if (or (not (eq (current-buffer) (live-tex-preview--document-buffer)))
@@ -1554,6 +1696,8 @@ the previews themselves with `live-tex-preview-buffer' or
                   #'live-tex-preview-mode--handle-post-cursor nil 'local)
         (add-hook 'post-command-hook
                   #'live-tex-preview--refresh-visible-overlays 90 'local)
+        (add-hook 'window-size-change-functions
+                  #'live-tex-preview--refresh-visible-overlays nil t)
         (when live-tex-preview-display-live
           (live-tex-preview-live--setup)))
     (remove-hook 'pre-command-hook
@@ -1562,6 +1706,8 @@ the previews themselves with `live-tex-preview-buffer' or
                  #'live-tex-preview-mode--handle-post-cursor 'local)
     (remove-hook 'post-command-hook
                  #'live-tex-preview--refresh-visible-overlays 'local)
+    (remove-hook 'window-size-change-functions
+                 #'live-tex-preview--refresh-visible-overlays t)
     (live-tex-preview-live--teardown)
     (live-tex-preview--cleanup)
     (dolist (ov (overlays-in (point-min) (point-max)))
@@ -2575,7 +2721,7 @@ Cache tests require stable content identity and inert metadata.  UI tests exerci
   (with-temp-buffer
     (let ((live-tex-preview-fit-to-window t)
           (live-tex-preview-fit-window-margin 2))
-      (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) 'window))
+      (cl-letf (((symbol-function 'get-buffer-window-list) (lambda (&rest _) '(window)))
                 ((symbol-function 'window-body-width)
                  (lambda (window pixelwise)
                    (should (eq window 'window))
@@ -2586,6 +2732,150 @@ Cache tests require stable content identity and inert metadata.  UI tests exerci
         (should (= (live-tex-preview--image-max-width) 880))))
     (let ((live-tex-preview-fit-to-window nil))
       (should-not (live-tex-preview--image-max-width)))))
+
+(ert-deftest live-tex-preview-test-indented-image-and-resize ()
+  (live-tex-preview-test--buffer "$x$\n\t  \\[y\\]"
+    (let ((live-tex-preview-fit-to-window t)
+          (live-tex-preview-lazy-display nil)
+          (live-tex-preview-fit-window-margin 2)
+          (width 900))
+      (cl-letf (((symbol-function 'get-buffer-window-list) (lambda (&rest _) '(wide narrow)))
+                ((symbol-function 'window-body-width)
+                 (lambda (window _) (if (eq window 'wide) 1200 width)))
+                ((symbol-function 'window-frame) (lambda (_) 'frame))
+                ((symbol-function 'frame-char-width) (lambda (_) 10))
+                ((symbol-function 'window-text-pixel-size)
+                 (lambda (_window beg end &rest _)
+                   (should (equal (buffer-substring beg end) "\t  "))
+                   '(100 . 20))))
+        (should (= (live-tex-preview--image-max-width 1) 880))
+        (should (= (live-tex-preview--image-max-width 8) 780))
+        (let* ((ov (live-tex-preview--ensure-overlay 8 (point-max)))
+               (info '(:file "/tmp/equation.svg" :height 2 :depth 0.2 :width 40)))
+          (overlay-put ov 'live-tex-preview-metadata info)
+          (overlay-put ov 'live-tex-preview-image (live-tex-preview-image info))
+          (live-tex-preview--sync-overlay-display ov)
+          (should (= (plist-get (cdr (overlay-get ov 'display)) :max-width) 780))
+          (setq width 400)
+          (live-tex-preview--refresh-visible-overlays)
+          (should (= (plist-get (cdr (overlay-get ov 'display)) :max-width) 280))
+          (setq width 50)
+          (live-tex-preview--refresh-visible-overlays)
+          (should (= (plist-get (cdr (overlay-get ov 'display)) :max-width) 1)))))))
+
+(ert-deftest live-tex-preview-test-auto-discovery-waits-for-exit ()
+  (live-tex-preview-test--buffer "$old$ and $new$ "
+    (let ((live-tex-preview-display-live nil)
+          (scans 0) submissions)
+      (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+        (live-tex-preview-auto-mode 1)
+        (setq-local live-tex-preview-scan-function
+                    (lambda (beg end) (cl-incf scans) (live-tex-preview--scan-region beg end))
+                    live-tex-preview-render-function
+                    (lambda (entries)
+                      (push (mapcar #'caddr entries) submissions)
+                      (dolist (entry entries)
+                        (live-tex-preview--ensure-overlay (car entry) (cadr entry)))))
+        (live-tex-preview--ensure-overlay 1 6)
+        (goto-char 12)
+        (live-tex-preview-auto--check (current-buffer))
+        (should-not submissions)
+        (should (= scans 1))
+        (goto-char (point-max))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (equal submissions '(("$new$"))))
+        (should (= scans 1))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (= (length submissions) 1))
+        ;; New text requires one new scan; unfinished math is ignored.
+        (insert "$later")
+        (live-tex-preview-auto--check (current-buffer))
+        (should (= scans 2))
+        (should (= (length submissions) 1))
+        (insert "$ ")
+        (live-tex-preview-auto--check (current-buffer))
+        (should (equal (car submissions) '("$later$")))
+        (live-tex-preview-mode -1)
+        (should-not live-tex-preview-auto-mode)
+        (should-not live-tex-preview-auto--timer)))))
+
+(ert-deftest live-tex-preview-test-auto-first-result-reentry ()
+  (live-tex-preview-test--buffer "$new$ "
+    (let ((live-tex-preview-display-live nil)
+          (live-tex-preview-lazy-display nil)
+          callback (renders 0))
+      (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t))
+                ((symbol-function 'live-tex-preview-render)
+                 (lambda (_strings cb &rest _) (cl-incf renders) (setq callback cb) nil)))
+        (live-tex-preview-auto-mode 1)
+        (goto-char (point-max))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (= renders 1))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (= renders 1)) ;pending render must not be duplicated
+        (goto-char 3)
+        (let ((ov (car (overlays-at 2))))
+          (live-tex-preview-mode--regenerate-overlay ov)
+          (should (= renders 1))) ;first preview cannot update inside
+        (funcall callback [(:file "/tmp/equation.svg" :height 1 :depth 0.2 :width 1)] nil)
+        (should-not (overlays-at 2))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (= renders 1))
+        (goto-char (point-max))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (= renders 2))
+        (funcall callback [(:file "/tmp/equation.svg" :height 1 :depth 0.2 :width 1)] nil)
+        (let ((ov (car (overlays-at 2))))
+          (should (overlay-get ov 'display))
+          (should-not (overlay-get ov 'live-tex-preview-defer-first))
+          ;; Once previewed, edits regenerate while point remains inside.
+          (goto-char 3)
+          (insert "z")
+          (live-tex-preview-live--regenerate)
+          (should (= renders 3)))
+        (setq live-tex-preview--jobs nil)
+        (live-tex-preview-mode -1)))))
+
+(ert-deftest live-tex-preview-test-buffer-enables-auto-and-clear-stops-it ()
+  (live-tex-preview-test--buffer "No equations yet. "
+    (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+      (live-tex-preview-buffer)
+      (should live-tex-preview-mode)
+      (should live-tex-preview-auto-mode)
+      (let ((old-timer live-tex-preview-auto--timer))
+        (live-tex-preview-buffer)
+        (should-not (memq old-timer timer-idle-list))
+        (let ((timer live-tex-preview-auto--timer))
+          (live-tex-preview-clear)
+          (should-not live-tex-preview-auto-mode)
+          (should-not live-tex-preview-auto--timer)
+          (should-not (memq timer timer-idle-list))))
+      (live-tex-preview-mode -1))))
+
+(ert-deftest live-tex-preview-test-auto-kill-cancels-timer ()
+  (let ((buffer (generate-new-buffer " *live-tex-auto-test*")) timer)
+    (unwind-protect
+        (with-current-buffer buffer
+          (latex-mode)
+          (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+            (live-tex-preview-auto-mode 1)
+            (setq timer live-tex-preview-auto--timer)))
+      (kill-buffer buffer))
+    (should-not (memq timer timer-idle-list))))
+
+(ert-deftest live-tex-preview-test-auto-major-mode-change-and-cloning ()
+  (live-tex-preview-test--buffer "No math yet."
+    (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+      (live-tex-preview-auto-mode 1)
+      (let ((timer live-tex-preview-auto--timer)
+            (inner (clone-indirect-buffer " *live-tex-auto-clone*" nil)))
+        (unwind-protect
+            (progn
+              (with-current-buffer inner (latex-mode))
+              (should (memq timer timer-idle-list))
+              (text-mode)
+              (should-not (memq timer timer-idle-list)))
+          (kill-buffer inner))))))
 
 (ert-deftest live-tex-preview-test-terminal ()
   (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () nil)))
@@ -2670,6 +2960,10 @@ Cache tests require stable content identity and inert metadata.  UI tests exerci
                 (insert "z")
                 (live-tex-preview-live--regenerate)
                 (live-tex-preview-test--await (car live-tex-preview--jobs))
+                ;; The edit's debounce can submit a newer generation while
+                ;; the explicit regeneration is still compiling.
+                (while live-tex-preview--jobs
+                  (live-tex-preview-test--await (car live-tex-preview--jobs)))
                 (should-not (equal old (plist-get (overlay-get ov 'live-tex-preview-metadata) :key)))
                 (live-tex-preview-mode--handle-pre-cursor)
                 (goto-char (overlay-end ov))
@@ -2874,6 +3168,51 @@ The suite distinguishes paired math from currency, rejects code and metadata, pe
 These cases prove that live repair cannot steal a later delimiter and that code/metadata transformations invalidate existing previews after debounced validation.
 
 #+begin_src emacs-lisp :tangle test/markdown-test.el
+(ert-deftest live-tex-preview-md-auto-discovery-excludes-code ()
+  (live-tex-preview-test--markdown
+      "Before $x$.\n\n`$inline_code$`\n\n```python\n$code$\n```\n\n$$y$$\n"
+    (let ((live-tex-preview-display-live nil) submissions)
+      (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+        (live-tex-preview-auto-mode 1)
+        (setq-local live-tex-preview-render-function
+                    (lambda (entries) (push (mapcar #'caddr entries) submissions)))
+        (goto-char 9)
+        (live-tex-preview-auto--check (current-buffer))
+        (should (equal submissions '(("$$y$$"))))
+        (goto-char (point-max))
+        (live-tex-preview-auto--check (current-buffer))
+        (should (equal (car submissions) '("$x$")))
+        (live-tex-preview-mode -1)))))
+
+(ert-deftest live-tex-preview-md-auto-respects-indirect-editing-point ()
+  (let ((host (generate-new-buffer " *live-tex-auto-host*")) inner)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer host
+            (markdown-mode)
+            (insert "Before $new$ after.\n")
+            (setq inner (make-indirect-buffer host " *live-tex-auto-inner*" t)))
+          (set-window-buffer (selected-window) inner)
+          (with-current-buffer inner
+            (latex-mode)
+            (goto-char 10)
+            (set-window-point (selected-window) 10))
+          (with-current-buffer host
+            (let ((live-tex-preview-display-live nil) submissions)
+              (cl-letf (((symbol-function 'live-tex-preview--graphical-frame-p) (lambda () t)))
+                (live-tex-preview-auto-mode 1)
+                (setq-local live-tex-preview-render-function
+                            (lambda (entries) (push (mapcar #'caddr entries) submissions)))
+                (goto-char (point-max)) ;host point is stale while editing inner
+                (live-tex-preview-auto--check host)
+                (should-not submissions)
+                (set-window-point (selected-window) 15)
+                (live-tex-preview-auto--check host)
+                (should (equal submissions '(("$new$"))))
+                (live-tex-preview-mode -1)))))
+      (when (buffer-live-p inner) (kill-buffer inner))
+      (kill-buffer host))))
+
 (ert-deftest live-tex-preview-md-current-fragment-and-regions ()
   (live-tex-preview-test--markdown "A $x$ and $$y$$ then $z$."
 				   (goto-char 4)
@@ -2923,7 +3262,8 @@ These cases prove that live repair cannot steal a later delimiter and that code/
 					     (should (overlay-get ov 'after-string))
 					     (goto-char (1- (overlay-end ov))) (insert "+1")
 					     (live-tex-preview-live--regenerate)
-					     (live-tex-preview-test--await (car live-tex-preview--jobs))
+					     (while live-tex-preview--jobs
+					       (live-tex-preview-test--await (car live-tex-preview--jobs)))
 					     (live-tex-preview-mode--handle-pre-cursor)
 					     (goto-char (overlay-end ov))
 					     (live-tex-preview-mode--handle-post-cursor)
@@ -3005,7 +3345,8 @@ Polymode tests assert host ownership, non-math exclusions, math-view attachment,
                 (should (overlay-get live-tex-preview-polymode--presentation 'after-string))
                 (insert "z")
                 (live-tex-preview-polymode--regenerate)
-                (live-tex-preview-test--await (car (buffer-local-value 'live-tex-preview--jobs host)))
+                (while (buffer-local-value 'live-tex-preview--jobs host)
+                  (live-tex-preview-test--await (car (buffer-local-value 'live-tex-preview--jobs host))))
                 (should-not (equal old-key (plist-get (overlay-get source 'live-tex-preview-metadata) :key)))
                 (live-tex-preview-polymode--before-switch inner host)
                 (should-not live-tex-preview-polymode--presentation))

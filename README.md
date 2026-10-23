@@ -88,11 +88,20 @@ The development-only automatic Org preview minor mode is no longer enabled.
 Existing LaTeX localleader keys are preserved: `v v` toggle live interaction,
 `v P` preview buffer, `v p` preview at point, `v c` clear previews, `v C` clear
 cached images. The raw-TeX toggle uses the new commands too.
+`v P` also enables `live-tex-preview-auto-mode`: after 0.5 seconds idle, new
+equations receive their first preview once point is outside them. Existing
+previews keep updating while typing. Discovery scans once after text changes;
+moving out of a deferred equation reuses that scan. Customize
+`live-tex-preview-auto-delay` to change the delay. `v c` stops discovery and
+clears previews; toggling `live-tex-preview-auto-mode` off keeps existing images.
 Interactive placement fits oversized previews inside the visible text area and
 realizes off-screen SVGs lazily by default. These safeguards are especially
 important when `visual-fill-column-mode`, `mixed-pitch-mode`, and preview zoom
 are used together. They can be customized with `live-tex-preview-fit-to-window`,
 `live-tex-preview-fit-window-margin`, and `live-tex-preview-lazy-display`.
+Fitting subtracts each equation's indentation in pixels, including tabs and font
+scaling, and refreshes on window resizing without recompiling. If the buffer is
+shown in several windows, previews fit the narrowest available text area.
 Markdown/Quarto host buffers use the same `v` bindings. Loading the old
 `live-tex-preview-tex` feature still works; commands now dispatch in the common
 library. A TeX mode hook firing in a Quarto indirect buffer cannot enable a TeX
@@ -150,7 +159,8 @@ incorrect macro extraction. TeX document-preamble resolution is unchanged.
 Live edits inspect the existing fragment with its overlay end as a strict limit;
 they do not invoke the whole-document scanner. Structural Markdown changes
 debounce validation of existing overlays, so wrapping a rendered equation in code
-removes its preview. Newly typed formulas still need an initial explicit preview.
+removes its preview. After buffer-wide preview enables automatic discovery,
+newly typed formulas receive their first preview after point leaves them.
 
 ## Rendering and placement APIs
 
@@ -209,8 +219,8 @@ can leave a `live-tex-job-*` scratch directory.
 This version supports the `latex` → DVI → `dvisvgm` path only. The previous
 optional dvipng compatibility advice was not retained. Remote TeX rendering and
 XeLaTeX/LuaLaTeX-only preambles are not supported. TeX runs with shell escape
-disabled. Newly typed fragments need an initial explicit preview before live
-editing starts, as in the former implementation. The scanner handles configured
+disabled. Automatic discovery is enabled by buffer-wide preview or explicitly
+with `live-tex-preview-auto-mode`. The scanner handles configured
 math delimiters and comments, not arbitrary TeX macro expansion or verbatim
 syntax. Deleting a delimiter invalidates its overlay rather than consuming the
 next equation. A failed compilation reports its diagnostics through the job
