@@ -12,6 +12,9 @@ live-tex-preview.el
 live-tex-preview-tex.el
 live-tex-preview-markdown.el
 live-tex-preview-polymode.el
+live-tex-preview-authoring.el
+test/authoring-test.el
+test/authoring-gui-smoke.el
 test/live-tex-preview-test.el
 test/markdown-test.el
 test/gui-smoke.el
@@ -52,9 +55,13 @@ case ${1:-check} in
     tangle) tangle ;;
     check-tangle) check_tangle ;;
     test) test_core ;;
+    test-authoring)
+        cd "$repo_dir"
+        exec "$emacs_command" -Q --batch -L . -l test/authoring-test.el \
+            --funcall ert-run-tests-batch-and-exit ;;
     check) check_tangle; test_core ;;
     *)
-        echo "usage: $0 {tangle|check-tangle|test|check}" >&2
+        echo "usage: $0 {tangle|check-tangle|test|test-authoring|check}" >&2
         exit 2
         ;;
 esac

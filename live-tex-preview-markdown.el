@@ -120,28 +120,40 @@ new fragments.  Ordinary typing inside a formula uses bounded live lookup."
   "Return non-nil for whitespace CHAR (or end of buffer)."
   (or (null char) (memq char '(?\s ?\t ?\n ?\r))))
 
-(defun live-tex-preview-markdown--excluded-p (pos)
-  "Return non-nil when markdown-mode recognizes non-prose at POS.
-Call after syntax propertization, in the host Markdown buffer.  Code block
-recognition includes tilde/backtick fences, YAML, and indented code.
-Inline code uses markdown-mode's delimiter matcher, not font-lock faces."
+(declare-function pm-innermost-span "polymode")
+(declare-function eieio-oref "eieio")
+
+(defun live-tex-preview-markdown-prose-p (pos &optional allow-comment allow-math)
+  "Return non-nil for document prose at POS.
+ALLOW-COMMENT permits an HTML producer comment.  ALLOW-MATH permits a
+Polymode math span, for equation scanning or label navigation.  Executable
+code, inline code and metadata remain excluded in either case."
   (save-excursion
     (save-match-data
-      (or (markdown-code-block-at-pos pos)
-          ;; markdown-mode marks an unfinished fence's opener but not its
-          ;; body.  Treat that body as code until its closing fence is typed.
-          (cl-some
-           (lambda (property)
-             (goto-char pos)
-             (when-let ((previous (markdown-find-previous-prop property)))
-               (goto-char (car previous))
-               (null (cadr (markdown-get-enclosing-fenced-block-construct)))))
-           (markdown-get-fenced-block-begin-properties))
-          (get-text-property pos 'markdown-yaml-metadata-section)
-          (markdown-inline-code-at-pos-p pos)
-          (nth 4 (syntax-ppss pos))
-          (and (featurep 'live-tex-preview-polymode)
-               (live-tex-preview-polymode--excluded-p pos))))))
+      (syntax-propertize (point-max))
+      (not
+       (or (markdown-code-block-at-pos pos)
+           ;; An unfinished fence may only mark its opening line.
+           (cl-some
+            (lambda (property)
+              (goto-char pos)
+              (when-let* ((previous (markdown-find-previous-prop property)))
+                (goto-char (car previous))
+                (null (cadr (markdown-get-enclosing-fenced-block-construct)))))
+            (markdown-get-fenced-block-begin-properties))
+           (get-text-property pos 'markdown-yaml-metadata-section)
+           (markdown-inline-code-at-pos-p pos)
+           (and (not allow-comment) (nth 4 (syntax-ppss pos)))
+           (and (bound-and-true-p polymode-mode)
+                (let ((span (pm-innermost-span pos)))
+                  (and (car span)
+                       (not (and allow-math
+                                 (memq (eieio-oref (nth 3 span) 'mode)
+                                       '(latex-mode LaTeX-mode tex-mode))))))))))))
+
+(defun live-tex-preview-markdown--excluded-p (pos)
+  "Return non-nil for non-prose at POS, allowing the equation's math span."
+  (not (live-tex-preview-markdown-prose-p pos nil t)))
 
 (defun live-tex-preview-markdown--prose-range-p (beg end)
   "Check that BEG to END stays in prose rather than crossing a code region.

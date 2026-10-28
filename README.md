@@ -1,6 +1,7 @@
 # live-tex-preview
 
-Personal Emacs package for asynchronous math previews in TeX, Markdown and Quarto.
+Emacs package for asynchronous math previews in TeX, Markdown and Quarto,
+with one optional authoring module for images, figure producers and navigation.
 GPL-3.0-or-later. This is an extracted and maintained personal implementation,
 not a MELPA release.
 
@@ -19,6 +20,8 @@ dependency. Edit the Org file and regenerate artifacts with:
 tree. `./literate test` runs the focused TeX/engine suite, and
 `./literate check` performs both checks. Markdown/Polymode tests still require
 their optional packages on `load-path`, as described under Verification.
+`./literate test-authoring` runs the authoring regressions; tests for unavailable
+optional frontends or citation backends are skipped.
 
 ## Architecture
 
@@ -38,6 +41,11 @@ their optional packages on `load-path`, as described under Verification.
 - `live-tex-preview-polymode.el`: optional host-overlay ownership and live math
   views for poly-markdown/poly-quarto. Executable inner buffers never enable the
   preview minor mode.
+- `live-tex-preview-authoring.el`: optional image previews, PDF/EPS conversion,
+  file/citation/reference navigation, explicit figure producers and the shared
+  action-at-point command. It uses the same document context and Markdown prose
+  exclusions as equations. It installs no keybindings or execution hooks and
+  is not loaded by the equation renderer.
 
 The renderer writes uncached fragments into one `preview.sty` document, runs
 `latex` once, then converts the DVI pages using `dvisvgm`. It reads height,
@@ -67,6 +75,11 @@ tokens reject results for overlays edited or deleted during compilation.
 - `markdown-mode` 2.6+ for Markdown/Quarto. Polymode and Quarto are optional,
   needed only when using those editing modes. No Quarto CLI is needed to preview
   math. Their own dependencies remain managed by their packages.
+- Citar is optional for authoring citation navigation in Markdown/Quarto.
+  TeX navigation uses built-in RefTeX. Images, producers and Quarto equation
+  references work without Citar. PDF/EPS images need Poppler, ImageMagick or
+  Ghostscript when conversion is requested; no converter is needed for SVG or
+  directly displayable raster images.
 
 Outside Doom:
 
@@ -79,20 +92,12 @@ Outside Doom:
 (add-hook 'poly-quarto-mode-hook #'live-tex-preview-mode)
 ```
 
-The repository's Doom `packages.el` declares a straight local recipe, plus
-posframe. `config.org` is the authoritative configuration; tangle it to update
-`config.el`, then run `doom sync` and restart Emacs. Org uses Doom's normal
-recipe/pin; Org buffers use stable Org's preview command and scale settings.
-The development-only automatic Org preview minor mode is no longer enabled.
-
-Existing LaTeX localleader keys are preserved: `v v` toggle live interaction,
-`v P` preview buffer, `v p` preview at point, `v c` clear previews, `v C` clear
-cached images. The raw-TeX toggle uses the new commands too.
-`v P` also enables `live-tex-preview-auto-mode`: after 0.5 seconds idle, new
+Your configuration chooses hooks, bindings and personal appearance settings.
+`live-tex-preview-buffer` also enables `live-tex-preview-auto-mode`: after 0.5 seconds idle, new
 equations receive their first preview once point is outside them. Existing
 previews keep updating while typing. Discovery scans once after text changes;
 moving out of a deferred equation reuses that scan. Customize
-`live-tex-preview-auto-delay` to change the delay. `v c` stops discovery and
+`live-tex-preview-auto-delay` to change the delay. `live-tex-preview-clear` stops discovery and
 clears previews; toggling `live-tex-preview-auto-mode` off keeps existing images.
 Interactive placement fits oversized previews inside the visible text area and
 realizes off-screen SVGs lazily by default. These safeguards are especially
@@ -102,11 +107,56 @@ are used together. They can be customized with `live-tex-preview-fit-to-window`,
 Fitting subtracts each equation's indentation in pixels, including tabs and font
 scaling, and refreshes on window resizing without recompiling. If the buffer is
 shown in several windows, previews fit the narrowest available text area.
-Markdown/Quarto host buffers use the same `v` bindings. Loading the old
+Markdown/Quarto host buffers expose the same interactive commands. Loading the old
 `live-tex-preview-tex` feature still works; commands now dispatch in the common
 library. A TeX mode hook firing in a Quarto indirect buffer cannot enable a TeX
-frontend there. The GitHub recipe migration is separate from this frontend work;
-the dotfiles currently still use the local package checkout.
+frontend there. No bindings are installed automatically, so Doom, Evil and other configurations
+can choose their own command maps.
+
+## Optional authoring commands
+
+Load `(require 'live-tex-preview-authoring)` to use images, figure producers,
+links, citations and equation references. This is part of the same package and
+repository; it does not enable equation modes or bind keys.
+
+- `live-tex-preview-authoring-preview-image-at-point` toggles one local image.
+- `live-tex-preview-authoring-preview-images-buffer` refreshes all local images.
+- `live-tex-preview-authoring-clear-image-previews` removes authoring overlays.
+- `live-tex-preview-authoring-follow-at-point` opens a file or ordinary link.
+- `live-tex-preview-authoring-follow-reference-at-point` follows citations or labels.
+- `live-tex-preview-authoring-run-figure-source` runs an explicit figure producer.
+- `live-tex-preview-authoring-dwim-at-point` recognizes the context and acts.
+  Pass a non-nil optional argument to return nil for ordinary prose, allowing
+  your own ENTER fallback. A recognized broken target still raises an error.
+
+TeX uses `\includegraphics` and producer comments inside its `figure`:
+
+```tex
+\begin{figure}
+  % !src = figures/energy.py
+  \includegraphics{figures/energy}
+\end{figure}
+```
+
+Markdown and Quarto use a producer directly before an image:
+
+```markdown
+<!-- !src = figures/energy.py -->
+![Energy](figures/energy.png){#fig-energy}
+```
+
+`!src` selects a runner by extension and quotes the source path. Alternatively,
+`!run` specifies the complete shell command. Execution only occurs through an
+explicit command, in the document/master directory. Refresh images after the
+producer finishes. PDF/EPS previews are cached by path, modification time and DPI.
+
+The default citation action opens the bibliography entry. Markdown bibliography
+files come from simple document YAML, the nearest `_quarto.yml` and
+`citar-bibliography`; this is a limited scalar/list reader, not a full Quarto
+configuration resolver. Quarto `@eq-...` references jump to labels, including
+version-control project documents. Code and metadata are excluded. The shared
+public context functions are `live-tex-preview-document-buffer`,
+`live-tex-preview-document-directory` and `live-tex-preview-markdown-prose-p`.
 
 ## Markdown and Quarto policy
 

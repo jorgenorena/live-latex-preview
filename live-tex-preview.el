@@ -440,12 +440,25 @@ message and return nil."
 (declare-function live-tex-preview-tex--setup "live-tex-preview-tex")
 (declare-function live-tex-preview-markdown--setup "live-tex-preview-markdown")
 
-(defun live-tex-preview--document-buffer ()
-  "Return the Markdown host for its indirect buffers, else this buffer."
+(defun live-tex-preview-document-buffer ()
+  "Return the Markdown host for its indirect buffers, else this buffer.
+Public context API shared by equation previews and optional authoring commands."
   (let ((base (buffer-base-buffer)))
     (if (and base (with-current-buffer base (derived-mode-p 'markdown-mode)))
         base
       (current-buffer))))
+
+(defalias 'live-tex-preview--document-buffer #'live-tex-preview-document-buffer)
+
+(defun live-tex-preview-document-directory ()
+  "Return the current document's directory using its frontend's rules.
+TeX resolves its master file, while Markdown resolves against its own file.
+This does not render equations or enable preview modes."
+  (with-current-buffer (live-tex-preview-document-buffer)
+    (save-restriction
+      (when (bound-and-true-p polymode-mode) (widen))
+      (live-tex-preview--prepare-frontend)
+      (funcall live-tex-preview-directory-function))))
 
 (defmacro live-tex-preview--with-document (&rest body)
   "Run BODY in the document host, preserving point and narrowing."
